@@ -1,0 +1,218 @@
+"""
+OLT Manager — Lock per OLT + Async Job Store.
+
+Fungsi:
+- Lock per OLT: mencegah race condition antar request & scheduler
+- Job store in-memory: untuk async job pattern (provisioning, dll)
+- Cleanup job otomatis via scheduler
+"""
+import asyncio
+import time
+import uuid
+import threading
+from functools import wraps
+from typing import Dict, Any, Optional
+
+
+class OLTManager:
+    def __init__(self):
+        # Lock per OLT (asyncio.Lock, karena dipakai di async context)
+        self.locks: Dict[str, asyncio.Lock] = {}
+        # Thread lock per OLT (untuk endpoint sync yang jalan di threadpool)
+        self.thread_locks: Dict[str, threading.Lock] = {}
+        self.thread_locks_guard = threading.Lock()
+        # Job store in-memory
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        # Thread lock untuk job store (karena bisa diakses dari thread berbeda)
+        self.jobs_lock = threading.Lock()
+        # Idempotency map: {(olt_id, resource_key): job_id}
+        self.active_resources: Dict[tuple, str] = {}
+        self.resources_lock = threading.Lock()
+
+    # =================== LOCK ===================
+    def get_lock(self, olt_id: str) -> asyncio.Lock:
+        """Ambil atau buat lock untuk OLT tertentu."""
+        if olt_id not in self.locks:
+            self.locks[olt_id] = asyncio.Lock()
+        return self.locks[olt_id]
+
+    def get_thread_lock(self, olt_id: str) -> threading.Lock:
+        """Ambil atau buat thread lock per OLT.
+        Untuk endpoint sync (def) yang jalan di threadpool FastAPI."""
+        with self.thread_locks_guard:
+            if olt_id not in self.thread_locks:
+                self.thread_locks[olt_id] = threading.Lock()
+            return self.thread_locks[olt_id]
+
+    # =================== JOB STORE ===================
+    def create_job(self, olt_id: str, job_type: str, resource_key: str = None) -> str:
+        """Buat job baru. Return job_id."""
+        job_id = str(uuid.uuid4())
+        now = time.time()
+        with self.jobs_lock:
+            self.jobs[job_id] = {
+                "id": job_id,
+                "olt_id": olt_id,
+                "type": job_type,
+                "status": "queued",
+                "progress": 0,
+                "message": "Menunggu antrean",
+                "result": None,
+                "error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        # Register resource key untuk idempotency
+        if resource_key:
+            with self.resources_lock:
+                self.active_resources[(olt_id, resource_key)] = job_id
+        return job_id
+
+    def update_job(self, job_id: str, **kwargs):
+        """Update field job."""
+        with self.jobs_lock:
+            if job_id in self.jobs:
+                self.jobs[job_id].update(kwargs)
+                self.jobs[job_id]["updated_at"] = time.time()
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Ambil job by ID."""
+        with self.jobs_lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job else None
+
+    def finish_job(self, job_id: str, status: str, result=None, error=None):
+        """Tandai job selesai & release resource key."""
+        with self.jobs_lock:
+            if job_id in self.jobs:
+                self.jobs[job_id].update({
+                    "status": status,
+                    "result": result,
+                    "error": error,
+                    "updated_at": time.time(),
+                    "progress": 100 if status == "success" else self.jobs[job_id].get("progress", 0),
+                })
+                olt_id = self.jobs[job_id]["olt_id"]
+        # Release resource keys milik job ini
+        with self.resources_lock:
+            keys_to_remove = [k for k, v in self.active_resources.items() if v == job_id]
+            for k in keys_to_remove:
+                del self.active_resources[k]
+
+    def create_job_atomic(self, olt_id: str, job_type: str,
+                          resource_key: str = None) -> tuple:
+        """Bikin job baru ATAU return existing job_id — atomik.
+        
+        Return: (job_id, is_new) — is_new=True kalau baru dibuat.
+        """
+        with self.resources_lock:
+            # Cek dulu apakah ada job aktif untuk resource ini
+            if resource_key:
+                existing = self.active_resources.get((olt_id, resource_key))
+                if existing:
+                    with self.jobs_lock:
+                        job = self.jobs.get(existing)
+                        if job and job["status"] not in ("success", "failed"):
+                            return (existing, False)
+
+            # Bikin job baru
+            job_id = str(uuid.uuid4())
+            now = time.time()
+            with self.jobs_lock:
+                self.jobs[job_id] = {
+                    "id": job_id,
+                    "olt_id": olt_id,
+                    "type": job_type,
+                    "status": "queued",
+                    "progress": 0,
+                    "message": "Menunggu antrean",
+                    "result": None,
+                    "error": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            if resource_key:
+                self.active_resources[(olt_id, resource_key)] = job_id
+
+            return (job_id, True)
+
+    def find_active_job(self, olt_id: str, resource_key: str) -> Optional[str]:
+        """Cek apakah ada job aktif untuk resource tertentu (idempotency)."""
+        with self.resources_lock:
+            job_id = self.active_resources.get((olt_id, resource_key))
+            if not job_id:
+                return None
+            # Verifikasi job masih aktif
+            with self.jobs_lock:
+                job = self.jobs.get(job_id)
+                if job and job["status"] not in ("success", "failed"):
+                    return job_id
+            return None
+
+    def cleanup_old_jobs(self, ttl: int = 3600, orphan_timeout: int = 300) -> Dict[str, int]:
+        """Bersihkan job lama. Return statistik."""
+        now = time.time()
+        deleted = 0
+        orphaned = 0
+        with self.jobs_lock:
+            to_delete = []
+            for jid, job in self.jobs.items():
+                age = now - job["updated_at"]
+                # Job selesai & sudah lama → hapus
+                if job["status"] in ("success", "failed") and age > ttl:
+                    to_delete.append(jid)
+                # Job stuck IN_PROGRESS terlalu lama → mark failed
+                elif job["status"] not in ("success", "failed") and age > orphan_timeout:
+                    job["status"] = "failed"
+                    job["error"] = f"Job stuck >{orphan_timeout}s — ditandai gagal oleh cleanup"
+                    job["updated_at"] = now
+                    orphaned += 1
+            for jid in to_delete:
+                del self.jobs[jid]
+                deleted += 1
+        return {"deleted": deleted, "orphaned": orphaned, "total_remaining": len(self.jobs)}
+
+
+# =================== DECORATOR ===================
+def olt_locked(fn):
+    """Decorator: serialize request per OLT pakai thread lock.
+    
+    Cari olt_id dari:
+    - kwargs['olt_id'] (int)
+    - args[0] kalau int (langsung olt_id)
+    - args[0].olt_id kalau objek (misal req.olt_id)
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        olt_id = None
+
+        # Cek kwargs
+        if 'olt_id' in kwargs:
+            olt_id = kwargs['olt_id']
+
+        # Cek args[0]
+        if olt_id is None and args:
+            first = args[0]
+            if isinstance(first, int):
+                olt_id = first
+            elif hasattr(first, 'olt_id'):
+                olt_id = first.olt_id
+
+        # Fallback: cek kwargs['req']
+        if olt_id is None and 'req' in kwargs:
+            req = kwargs['req']
+            if hasattr(req, 'olt_id'):
+                olt_id = req.olt_id
+
+        if olt_id is None:
+            # Tidak dapat olt_id — panggil tanpa lock
+            return fn(*args, **kwargs)
+
+        with olt_manager.get_thread_lock(str(olt_id)):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+# =================== SINGLETON ===================
+olt_manager = OLTManager()

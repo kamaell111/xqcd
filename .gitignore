@@ -1,0 +1,59 @@
+# =================== Python ===================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# =================== Virtual Environment ===================
+venv/
+.venv/
+env/
+ENV/
+
+# =================== Environment & Secrets ===================
+.env
+.env.local
+*.env.backup
+
+# =================== Database ===================
+*.db
+*.db.bak
+*.db.bak_*
+*.db-shm
+*.db-wal
+backend/data/*.db*
+!backend/data/.gitkeep
+
+# =================== Logs ===================
+*.log
+logs/
+netmiko_session.log
+
+# =================== Backups ===================
+backup/
+*.zip
+
+# =================== IDE ===================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# =================== Testing ===================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =================== Docker ===================
+*.pid
+
+# Backup files
+*.bak
+*.bak*
+*.orig

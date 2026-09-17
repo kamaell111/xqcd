@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual env
+venv/
+.venv/
+env/
+ENV/
+
+# Env & secrets
+.env
+.env.local
+*.env.backup
+
+# Database
+*.db
+*.db.bak
+*.db.bak_*
+*.db-shm
+*.db-wal
+data/*.db*
+!data/.gitkeep
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+*.bak*
+*.orig
