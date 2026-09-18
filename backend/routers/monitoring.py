@@ -6,7 +6,6 @@ from database import get_db
 from models import OLT, PONPort, ONU, Interface, User, Alert
 from schemas import PONPortOut, ONUOut
 from auth import get_current_user
-from snmp_client import SNMPClient
 
 router = APIRouter(prefix="/api/v1/olts", tags=["monitoring"])
 

@@ -848,10 +848,15 @@ async function deleteONU(onuId) {
 // =================== PROVISION WIZARD ===================
 let provisionData = {};
 let provisionStep = 0;
+let _skipWizardReset = false;   // flag: jangan reset kalau dipanggil dari provisionDetected
 
 document.getElementById("btn-provision-onu")?.addEventListener("click", () => {
-  provisionData = {};
-  provisionStep = 0;
+  // ⭐ Skip reset kalau dipanggil dari provisionDetected (sudah di-set state-nya)
+  if (!_skipWizardReset) {
+    provisionData = {};
+    provisionStep = 0;
+  }
+  _skipWizardReset = false;   // reset flag setelah dipakai
   openModal("Provision ONU Baru", `<div id="wizard-content"></div>`);
   renderWizard();
 });
@@ -1070,21 +1075,28 @@ function provisionDetected(sn, onuIndex) {
   if (!m) { toast("Format ONU index tidak dikenali", "error"); return; }
   const ponFull = m[1];              // 1/1/1
   const onuId = parseInt(m[2]);
-  const ponShort = ponFull.split("/").slice(-1)[0];  // 1
-  toast(`Buka form Provision untuk SN ${sn} (PON 1/1/${ponShort}:${onuId})`, "info");
-  // Trigger tombol Provision ONU bawaan
+
+  // ⭐ Set provisionData DULU sebelum buka wizard
+  // Wizard akan auto-populate dari state ini (template sudah pakai value="${provisionData.X}")
+  provisionData = {
+    pon_port: ponFull,
+    onu_id: onuId,
+    serial_number: sn,
+    name: "",
+    onu_type: "F609",
+  };
+  provisionStep = 0;   // mulai dari step 1 (Pilih PON)
+
+  toast(`Buka form Provision untuk SN ${sn}`, "info");
+
+  // ⭐ Set flag supaya button handler tidak reset provisionData
+  _skipWizardReset = true;
+
+  // Pindah ke menu ONU + buka wizard
   document.querySelector('[data-page="onus"]').click();
   setTimeout(() => {
     const btn = document.getElementById("btn-provision-onu");
     if (btn) btn.click();
-    setTimeout(() => {
-      const snInput = document.getElementById("w-sn");
-      const ponSel = document.getElementById("w-pon");
-      const onuInput = document.getElementById("w-onu-id");
-      if (snInput) snInput.value = sn;
-      if (ponSel) ponSel.value = "1/1/" + ponShort;
-      if (onuInput) onuInput.value = onuId;
-    }, 100);
   }, 200);
 }
 

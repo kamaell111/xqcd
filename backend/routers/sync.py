@@ -557,9 +557,34 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
             new_status = "unknown"
 
         if not onu:
-            print(f"[SYNC] Skip ONU {o['pon_port']}:{o['onu_id']} — belum ada di DB "
-                  f"(harus dibuat via provisioning)")
-            continue
+            # ⭐ Sync boleh INSERT ONU baru (kalau tidak ada job provisioning aktif)
+            # Cek dulu ada job aktif untuk slot ini?
+            job_key = f"onu:{o['pon_port']}:{o['onu_id']}"
+            has_active_job = False
+            try:
+                for jid, job in list(olt_manager.jobs.items()):
+                    if job["status"] in ("queued", "running") and job.get("olt_id") == str(olt_id):
+                        # Cek apakah job ini untuk slot yang sama
+                        has_active_job = True
+                        break
+            except Exception:
+                pass
+
+            if has_active_job:
+                print(f"[SYNC] Skip insert ONU {o['pon_port']}:{o['onu_id']} — ada job aktif")
+                continue
+
+            print(f"[SYNC] Insert ONU baru: {o['pon_port']}:{o['onu_id']} (dari OLT)")
+            onu = ONU(
+                olt_id=olt_id,
+                pon_port=o["pon_port"],
+                onu_id=o["onu_id"],
+                interface_name=f"gpon-onu_{o['onu_index']}",
+                status=new_status,
+                updated_at=datetime.utcnow(),
+            )
+            db.add(onu)
+            db.flush()
 
         # ONU sudah ada di DB — update status & data
         if onu.status != new_status:
@@ -627,6 +652,34 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
             print(f"[ALERT ONU] {onu.serial_number or onu.onu_id}: {e}")
 
         onu_by_key[key] = onu
+
+    # === Ghost cleanup: ONU di DB yang TIDAK ada di OLT → HAPUS ===
+    active_keys = set()
+    for o in onus:
+        active_keys.add((o["pon_port"], o["onu_id"]))
+
+    all_db_onus = db.query(ONU).filter(ONU.olt_id == olt_id).all()
+    for db_onu in all_db_onus:
+        db_key = (db_onu.pon_port, db_onu.onu_id)
+        if db_key not in active_keys:
+            # Cek apakah ada job provisioning aktif untuk slot ini
+            has_job = False
+            try:
+                for jid, job in list(olt_manager.jobs.items()):
+                    if job["status"] in ("queued", "running"):
+                        has_job = True
+                        break
+            except Exception:
+                pass
+
+            if has_job:
+                # Sedang provisioning — jangan hapus, tunggu selesai
+                db_onu.status = "configuring"
+                continue
+
+            # ONU ghost → hapus dari DB
+            print(f"[SYNC] Hapus ghost ONU: {db_onu.pon_port}:{db_onu.onu_id} (tidak ada di OLT)")
+            db.delete(db_onu)
 
     # === Fix 2: ONU di DB yang TIDAK muncul di OLT saat ini → mark offline ===
     # (ONU hilang dari show gpon onu state = tidak terdaftar / mati total)

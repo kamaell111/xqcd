@@ -57,3 +57,6 @@ htmlcov/
 *.bak
 *.bak*
 *.orig
+
+# Env variants (.env.lan, .env.home, dll)
+.env.*
