@@ -176,6 +176,13 @@ class OLTClient:
                 cmd = raw_cmd.strip()   # <-- strip leading/trailing spaces
                 if not cmd:
                     continue
+
+                # ⭐ Handle delay marker
+                if cmd == "__DELAY_3S__":
+                    import time as _t
+                    _t.sleep(3)
+                    output_lines.append(">>> __DELAY_3S__ (3 detik)")
+                    continue
                 try:
                     out = conn.send_command_timing(
                         cmd,
@@ -251,6 +258,9 @@ class OLTClient:
         for raw in commands:
             c = raw.strip()
             if not c or c.startswith("!") or c.startswith("#"):
+                continue
+            # ⭐ Skip marker internal (delay, dsb)
+            if c.startswith("__") and c.endswith("__"):
                 continue
             if self._BLACKLIST.match(c):
                 errors.append(f"Command dilarang (berbahaya): {c}")

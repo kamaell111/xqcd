@@ -180,57 +180,80 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
                   "ONU tidak terdaftar setelah timeout", "failed")
             return
 
-        # Milestone 4: polling PPPoE (LEPAS LOCK saat sleep)
-        olt_manager.update_job(job_id, progress=60,
-                               message="Menunggu modem dial PPPoE")
-        pppoe_status = "unknown"
+        # ⭐ Cek mode: routed (ZTE) atau bridge (Huawei/dll)
+        from vendor_detect import detect_vendor, get_capability
+        detected_vendor_early = detect_vendor(req.serial_number)
+        is_bridge_mode = not get_capability(detected_vendor_early)["supports_routed"]
+
+        pppoe_status = "bridge" if is_bridge_mode else "unknown"
         pppoe_dur = 0
         pppoe_user = req.pppoe_user
         pppoe_nat = False
 
-        for _ in range(10):   # max 10 × 3s = 30s
-            time.sleep(3)
-            lock.acquire()
-            try:
-                conn = client._connect()
+        # Milestone 4: polling PPPoE (SKIP kalau bridge mode)
+        if is_bridge_mode:
+            olt_manager.update_job(job_id, progress=60,
+                                   message=f"Bridge mode ({detected_vendor_early}) — skip PPPoE")
+            print(f"[PROVISION] {detected_vendor_early} → bridge mode, skip PPPoE polling")
+        else:
+            olt_manager.update_job(job_id, progress=60,
+                                   message="Menunggu modem dial PPPoE")
+            for _ in range(10):   # max 10 × 3s = 30s
+                time.sleep(3)
+                lock.acquire()
                 try:
-                    pppoe_out = conn.send_command_timing(
-                        f"show gpon remote-onu pppoe gpon-onu_{onu_index}",
-                        read_timeout=20,
-                    )
-                    m = re.search(r"Status:\s+(\S+)", pppoe_out)
-                    if m:
-                        pppoe_status = m.group(1).lower()
-                    m = re.search(r"Online duration:\s+(\d+)", pppoe_out)
-                    if m:
-                        pppoe_dur = int(m.group(1))
-                    m = re.search(r"Username:\s+(\S+)", pppoe_out)
-                    if m:
-                        pppoe_user = m.group(1)
-                    m = re.search(r"NAT:\s+(\S+)", pppoe_out)
-                    if m and m.group(1) == "enable":
-                        pppoe_nat = True
-                    if pppoe_status == "connected":
-                        break
+                    conn = client._connect()
+                    try:
+                        pppoe_out = conn.send_command_timing(
+                            f"show gpon remote-onu pppoe gpon-onu_{onu_index}",
+                            read_timeout=20,
+                        )
+                        m = re.search(r"Status:\s+(\S+)", pppoe_out)
+                        if m:
+                            pppoe_status = m.group(1).lower()
+                        m = re.search(r"Online duration:\s+(\d+)", pppoe_out)
+                        if m:
+                            pppoe_dur = int(m.group(1))
+                        m = re.search(r"Username:\s+(\S+)", pppoe_out)
+                        if m:
+                            pppoe_user = m.group(1)
+                        m = re.search(r"NAT:\s+(\S+)", pppoe_out)
+                        if m and m.group(1) == "enable":
+                            pppoe_nat = True
+                        if pppoe_status == "connected":
+                            break
+                    finally:
+                        conn.disconnect()
+                except Exception as e:
+                    print(f"[PROVISION] PPPoE check error: {e}")
                 finally:
-                    conn.disconnect()
-            except Exception as e:
-                print(f"[PROVISION] PPPoE check error: {e}")
-            finally:
-                lock.release()
+                    lock.release()
 
         # ⭐ Setelah loop selesai: cek apakah PPPoE berhasil
         warning_msg = None
-        if pppoe_status == "connected":
-            pass   # OK, tidak ada warning
+
+        # Skip warning check kalau bridge mode (normal)
+        if is_bridge_mode:
+            pass
+        elif req.pppoe_user and pppoe_user and pppoe_user != req.pppoe_user:
+            warning_msg = (
+                f"⚠️ Mismatch! Kita kirim user='{req.pppoe_user}', "
+                f"tapi modem pakai user='{pppoe_user}'. "
+                f"Kemungkinan command tidak nempel."
+            )
+            print(f"[PROVISION] {warning_msg}")
+            pppoe_status = "config_mismatch"
+        elif pppoe_status == "connected":
+            # Match + connected → sempurna
+            pass
         elif pppoe_status in ("connecting", "idle", ""):
             # Masih dial setelah 30s → tandai dial_failed
             pppoe_status = "dial_failed"
             warning_msg = (
                 f"PPPoE belum connect setelah 30 detik. "
-                f"Cek kredensial modem (user={pppoe_user or '-'}) atau fisik modem."
+                f"Cek kredensial (user={pppoe_user or '-'}) di Mikrotik atau fisik modem."
             )
-            print(f"[PROVISION] ONU {onu_index} — PPPoE {warning_msg}")
+            print(f"[PROVISION] ONU {onu_index} — {warning_msg}")
         elif pppoe_status == "disconnected":
             warning_msg = f"PPPoE disconnected — cek modem/kredensial"
         else:
@@ -287,6 +310,10 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
                   "Duplicate slot — skip insert", "failed")
             return
 
+        # ⭐ Resolve vendor untuk disimpan di DB
+        from zxan_parser import get_vendor_info
+        vinfo = get_vendor_info(req)
+
         onu = ONU(
             olt_id=req.olt_id, pon_port=req.pon_port, onu_id=req.onu_id,
             interface_name=f"gpon-onu_{onu_index}",
@@ -298,6 +325,10 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
             pppoe_online_duration=pppoe_dur,
             internet_checked_at=datetime.utcnow(),
             optical_rx=optical_rx, optical_tx=optical_tx, distance=distance,
+            # ⭐ Multi-vendor fields
+            vendor=vinfo["vendor"],
+            provisioning_mode=vinfo["provisioning_mode"],
+            vendor_source=vinfo["vendor_source"],
         )
         db.add(onu)
         db.commit()
@@ -313,6 +344,10 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
             "optical_tx": optical_tx,
             "distance": distance,
             "warning": warning_msg,
+            # ⭐ Multi-vendor info
+            "vendor": vinfo["vendor"],
+            "provisioning_mode": vinfo["provisioning_mode"],
+            "vendor_source": vinfo["vendor_source"],
         })
 
     except Exception as e:
@@ -450,3 +485,47 @@ def delete_onu(olt_id: int, onu_id: int, db: Session = Depends(get_db),
     db.commit()
     audit(db, user.username, "delete_onu", onu.serial_number or "")
     return {"ok": True, "olt_had_onu": onu_exists_in_olt, "delete_log": delete_log}
+
+# =================== MARK BRIDGE CONFIGURED ===================
+@router.post("/{olt_id}/{onu_id}/mark-connected")
+@olt_locked
+def mark_connected(olt_id: int, onu_id: int, db: Session = Depends(get_db),
+                   user: User = Depends(require_privilege(10))):
+    """Tandai bridge mode = configured (user sudah set PPPoE di GUI modem).
+    Mengubah status Internet jadi CONNECTED."""
+    olt = db.query(OLT).get(olt_id)
+    if not olt:
+        raise HTTPException(404, "OLT tidak ditemukan")
+    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    if not onu:
+        raise HTTPException(404, "ONU tidak ditemukan")
+
+    onu.bridge_configured = True
+    onu.pppoe_status = "connected"
+    onu.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(onu)
+    audit(db, user.username, "mark_connected", onu.serial_number or str(onu_id))
+    return {"ok": True, "onu_id": onu_id, "bridge_configured": True}
+
+
+@router.post("/{olt_id}/{onu_id}/mark-disconnected")
+@olt_locked
+def mark_disconnected(olt_id: int, onu_id: int, db: Session = Depends(get_db),
+                      user: User = Depends(require_privilege(10))):
+    """Tandai bridge mode = belum dikonfigurasi (user belum set PPPoE di GUI).
+    Mengubah status Internet jadi BELUM SETUP."""
+    olt = db.query(OLT).get(olt_id)
+    if not olt:
+        raise HTTPException(404, "OLT tidak ditemukan")
+    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    if not onu:
+        raise HTTPException(404, "ONU tidak ditemukan")
+
+    onu.bridge_configured = False
+    onu.pppoe_status = "bridge"
+    onu.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(onu)
+    audit(db, user.username, "mark_disconnected", onu.serial_number or str(onu_id))
+    return {"ok": True, "onu_id": onu_id, "bridge_configured": False}

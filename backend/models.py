@@ -91,6 +91,11 @@ class ONU(Base):
     vlan = Column(Integer, nullable=True)
     pppoe_user = Column(String(64), nullable=True)
     pppoe_nat = Column(Boolean, default=False)
+    # ⭐ Multi-vendor support
+    vendor = Column(String(16), default="ZTE")             # ZTE|Huawei|FiberHome|Unknown
+    provisioning_mode = Column(String(16), default="routed")   # routed|bridge
+    vendor_source = Column(String(16), default="sn_prefix")    # sn_prefix|manual|conflict
+    bridge_configured = Column(Boolean, default=False)     # ⭐ manual confirm untuk bridge mode
     # Status internet real (dari remote-onu pppoe)
     pppoe_status = Column(String(16), default="unknown")   # connected|disconnected|connecting|unknown
     pppoe_online_duration = Column(Integer, default=0)     # detik

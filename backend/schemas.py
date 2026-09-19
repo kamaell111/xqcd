@@ -96,6 +96,11 @@ class ONUOut(BaseModel):
     pppoe_status: Optional[str] = "unknown"
     pppoe_online_duration: Optional[int] = 0
     internet_checked_at: Optional[datetime] = None
+    # ⭐ Multi-vendor
+    vendor: Optional[str] = "ZTE"
+    provisioning_mode: Optional[str] = "routed"
+    vendor_source: Optional[str] = "sn_prefix"
+    bridge_configured: Optional[bool] = False
     last_online: Optional[datetime] = None
     last_offline: Optional[datetime] = None
 
@@ -121,6 +126,9 @@ class ONUProvisionRequest(BaseModel):
     pppoe_user: Optional[str] = None
     pppoe_password: Optional[str] = None
     enable_nat: bool = True
+    # ⭐ Multi-vendor
+    vendor: Optional[str] = None              # None = auto-detect
+    provisioning_mode: Optional[str] = None   # None = auto based on vendor
 
 
 class VLANCreate(BaseModel):

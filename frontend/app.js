@@ -687,11 +687,47 @@ async function loadPONDetail(opts = {}) {
 }
 
 // =================== ONU ===================
+// =================== VENDOR DETECTION (Frontend Mirror) ===================
+const VENDOR_PREFIX_MAP = {
+  "ZTEG": "ZTE", "YYKC": "ZTE", "ZTEC": "ZTE", "ZTEZ": "ZTE",
+  "HWTC": "Huawei",
+  "FHTT": "FiberHome",
+  "ALCL": "Alcatel-Lucent",
+};
+
+function detectVendorFromSN(sn) {
+  if (!sn) return "Unknown";
+  const prefix = sn.trim().toUpperCase().slice(0, 4);
+  return VENDOR_PREFIX_MAP[prefix] || "Unknown";
+}
+
+function isRoutedSupported(vendor) {
+  return vendor === "ZTE";
+}
+
+function renderVendorBadge(o) {
+  const label = o.vendor || "Unknown";
+  // Semua vendor warna hijau (konsisten) — badge cuma info merek
+  return `<span class="status-badge online" title="Merek: ${label}">${label}</span>`;
+}
+
 function renderInternetStatus(o) {
   const onuStatus = (o.status || "unknown").toLowerCase();
   const status = (o.pppoe_status || "unknown").toLowerCase();
+  const mode = (o.provisioning_mode || "routed").toLowerCase();
   const dur = o.pppoe_online_duration || 0;
   let cls, label, icon, title;
+
+  // ⭐ BRIDGE MODE — status tergantung konfirmasi user
+  if (mode === "bridge" || status === "bridge") {
+    if (onuStatus !== "online") {
+      return `<span class="status-badge offline" title="ONU offline"><i class="fas fa-times-circle"></i> DISCONNECTED</span>`;
+    }
+    if (o.bridge_configured) {
+      return `<span class="status-badge online" title="User sudah set PPPoE di GUI modem"><i class="fas fa-check-circle"></i> CONNECTED</span>`;
+    }
+    return `<span class="status-badge warning" title="Belum dikonfigurasi — set PPPoE di GUI modem lalu klik ✓ Aktif"><i class="fas fa-hourglass-half"></i> BELUM SETUP</span>`;
+  }
 
   // ⭐ ATURAN LOGIS: kalau ONU LOS atau OFFLINE → internet PASTI mati
   // (fiber putus / modem mati = tidak mungkin ada internet)
@@ -766,7 +802,7 @@ async function loadONUs(opts = {}) {
     el.innerHTML = `
       <table>
         <thead><tr>
-          <th>Interface</th><th>Serial Number</th><th>Nama</th><th>ONU</th>
+          <th>Interface</th><th>Serial Number</th><th>Nama</th><th>Merek</th><th>ONU</th>
           <th>Internet</th><th>RX (dBm)</th><th>Distance</th><th>VLAN</th><th>PPPoE</th><th>Aksi</th>
         </tr></thead>
         <tbody>
@@ -775,6 +811,7 @@ async function loadONUs(opts = {}) {
               <td><b>${escapeHtml(o.interface_name || `${o.pon_port}:${o.onu_id}`)}</b></td>
               <td><code>${escapeHtml(o.serial_number || "-")}</code></td>
               <td>${escapeHtml(o.name || "-")}</td>
+              <td>${renderVendorBadge(o)}</td>
               <td><span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(o.status)}</span></td>
               <td>${renderInternetStatus(o)}</td>
               <td>${o.optical_rx != null ? o.optical_rx + " dBm" : "-"}</td>
@@ -783,6 +820,11 @@ async function loadONUs(opts = {}) {
               <td>${escapeHtml(o.pppoe_user || "-")}</td>
               <td>
                 <button class="btn-icon" onclick="showONUDetail(${o.onu_id})" title="Detail"><i class="fas fa-eye"></i></button>
+                ${(o.provisioning_mode === "bridge") ? (
+                  o.bridge_configured
+                    ? `<button class="btn-icon" onclick="markDisconnected(${o.onu_id})" title="Tandai Internet Mati" style="color:var(--yellow)"><i class="fas fa-times-circle"></i></button>`
+                    : `<button class="btn-icon" onclick="markConnected(${o.onu_id})" title="Tandai Internet Aktif" style="color:var(--green)"><i class="fas fa-check-circle"></i></button>`
+                ) : ""}
                 <button class="btn-icon" onclick="rebootONU(${o.onu_id})" title="Reboot"><i class="fas fa-power-off"></i></button>
                 <button class="btn-icon" onclick="deleteONU(${o.onu_id})" title="Hapus dari OLT" style="color:var(--red)"><i class="fas fa-trash"></i></button>
               </td>
@@ -820,6 +862,24 @@ async function showONUDetail(onuId) {
         <tr><td>Internet Dicek</td><td>${o.internet_checked_at ? new Date(o.internet_checked_at).toLocaleString("id-ID") : "-"}</td></tr>
       </table>
     `);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function markConnected(onuId) {
+  if (!confirm("Tandai ONU ini sebagai CONNECTED? (user sudah set PPPoE di GUI modem)")) return;
+  try {
+    await api(`/onu/${CURRENT_OLT_ID}/${onuId}/mark-connected`, { method: "POST" });
+    toast("✅ Status: CONNECTED", "success");
+    loadONUs();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function markDisconnected(onuId) {
+  if (!confirm("Tandai ONU ini sebagai BELUM SETUP?")) return;
+  try {
+    await api(`/onu/${CURRENT_OLT_ID}/${onuId}/mark-disconnected`, { method: "POST" });
+    toast("Status: BELUM SETUP", "warning");
+    loadONUs();
   } catch (e) { toast(e.message, "error"); }
 }
 
@@ -877,17 +937,38 @@ function renderWizard() {
       <div class="form-group"><label>ONU ID</label><input type="number" id="w-onu-id" value="${provisionData.onu_id || 1}" min="1" max="128"></div>
     `;
   } else if (provisionStep === 1) {
+    const detectedVendor = detectVendorFromSN(provisionData.serial_number);
+    const vendorDisplay = detectedVendor === "Unknown" ? "Tidak dikenali — pakai mode bridge" : `Terdeteksi: ${detectedVendor}`;
+    const vendorColor = detectedVendor === "ZTE" ? "var(--green)"
+                       : detectedVendor === "Huawei" ? "var(--yellow)"
+                       : detectedVendor === "FiberHome" ? "var(--primary)"
+                       : "var(--text-dim)";
     html += `
       <div class="form-group"><label>Serial Number</label><input id="w-sn" placeholder="YYKC37D4BADA" value="${escapeHtml(provisionData.serial_number || "")}"></div>
+      <div style="background:var(--bg);padding:10px 14px;border-radius:8px;border-left:3px solid ${vendorColor};font-size:12px;margin-bottom:14px">
+        <i class="fas fa-info-circle" style="color:${vendorColor}"></i>
+        <b>Vendor:</b> ${escapeHtml(vendorDisplay)}
+      </div>
       <div class="form-group"><label>Nama ONU</label><input id="w-name" placeholder="CLIENT-001" value="${escapeHtml(provisionData.name || "")}"></div>
-      <div class="form-group"><label>Tipe ONU</label>
+      <div class="form-group"><label>Tipe ONU (definisi di OLT)</label>
         <select id="w-type">
           <option>F609</option><option>F601</option><option>F660</option><option>F670L</option>
         </select>
       </div>
     `;
   } else if (provisionStep === 2) {
+    const detectedVendor = detectVendorFromSN(provisionData.serial_number);
+    const routedOk = isRoutedSupported(detectedVendor);
+    const pppoeDisabled = routedOk ? "" : "disabled";
+    const pppoeStyle = routedOk ? "" : "opacity:0.5;cursor:not-allowed";
+    const pppoeInfo = routedOk ? "" : `
+      <div style="background:rgba(245,158,11,0.1);padding:10px 14px;border-radius:8px;border-left:3px solid var(--yellow);font-size:12px;margin-bottom:14px">
+        <i class="fas fa-exclamation-triangle" style="color:var(--yellow)"></i>
+        <b>Bridge Mode:</b> Vendor ${escapeHtml(detectedVendor)} tidak support PPPoE via OLT (OMCI proprietary ZTE).
+        PPPoE harus di-set manual di GUI modem. Field PPPoE di bawah di-disable.
+      </div>`;
     html += `
+      ${pppoeInfo}
       <div class="form-group"><label>TCONT Profile</label><input id="w-tcont" value="${escapeHtml(provisionData.tcont_profile || "1G")}"></div>
       <div class="form-group"><label>TCONT Name</label><input id="w-tcont-name" value="${escapeHtml(provisionData.tcont_name || "PON1")}"></div>
       <div class="form-group"><label>GEMPORT ID</label><input type="number" id="w-gem" value="${provisionData.gemport_id || 1}"></div>
@@ -896,8 +977,8 @@ function renderWizard() {
       <div class="form-group"><label>VPort</label><input type="number" id="w-vport" value="${provisionData.vport || 1}"></div>
       <div class="form-group"><label>User VLAN</label><input type="number" id="w-uvlan" value="${provisionData.user_vlan || 15}"></div>
       <div class="form-group"><label>VLAN</label><input type="number" id="w-vlan" value="${provisionData.vlan || 15}"></div>
-      <div class="form-group"><label>PPPoE User (opsional)</label><input id="w-pppoe" value="${escapeHtml(provisionData.pppoe_user || "")}"></div>
-      <div class="form-group"><label>PPPoE Password (opsional)</label><input type="password" id="w-pppoe-pass"></div>
+      <div class="form-group" style="${pppoeStyle}"><label>PPPoE User ${routedOk ? "(opsional)" : "(tidak tersedia)"}</label><input id="w-pppoe" ${pppoeDisabled} value="${escapeHtml(provisionData.pppoe_user || "")}"></div>
+      <div class="form-group" style="${pppoeStyle}"><label>PPPoE Password</label><input type="password" id="w-pppoe-pass" ${pppoeDisabled}></div>
     `;
   } else if (provisionStep === 3) {
     html += `<h4 style="margin-bottom:10px;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">Preview CLI ZXAN</h4>
@@ -957,8 +1038,16 @@ function collectWizardData() {
     provisionData.vport = parseInt(document.getElementById("w-vport").value);
     provisionData.user_vlan = parseInt(document.getElementById("w-uvlan").value);
     provisionData.vlan = parseInt(document.getElementById("w-vlan").value);
-    provisionData.pppoe_user = document.getElementById("w-pppoe").value || null;
-    provisionData.pppoe_password = document.getElementById("w-pppoe-pass").value || null;
+    // Handle PPPoE field (mungkin disabled kalau Huawei)
+    const pppoeEl = document.getElementById("w-pppoe");
+    const pppoePassEl = document.getElementById("w-pppoe-pass");
+    if (pppoeEl && !pppoeEl.disabled) {
+      provisionData.pppoe_user = pppoeEl.value || null;
+      provisionData.pppoe_password = pppoePassEl ? (pppoePassEl.value || null) : null;
+    } else {
+      provisionData.pppoe_user = null;
+      provisionData.pppoe_password = null;
+    }
   }
   return true;
 }
@@ -966,7 +1055,10 @@ function collectWizardData() {
 function generatePreview() {
   const d = provisionData;
   const iface = `gpon-onu_${d.pon_port}:${d.onu_id}`;
-  return `configure terminal
+  const vendor = detectVendorFromSN(d.serial_number);
+  const routedOk = isRoutedSupported(vendor);
+
+  let cmds = `configure terminal
 interface gpon-olt_${d.pon_port}
 onu ${d.onu_id} type ${d.onu_type} sn ${d.serial_number}
 exit
@@ -980,11 +1072,23 @@ interface ${iface}
 exit
 pon-onu-mng ${iface}
   service ${d.tcont_name} gemport ${d.gemport_id} iphost 1 vlan ${d.vlan}
-  ${d.pppoe_user ? `pppoe 1 nat enable user ${d.pppoe_user} password ${d.pppoe_password || "zte"}` : ""}
+  vlan port eth_0/1 mode tag vlan ${d.vlan}
+  vlan port eth_0/2 mode tag vlan ${d.vlan}`;
+
+  // Cuma ZTE yang support routed (proprietary)
+  if (routedOk && d.pppoe_user) {
+    cmds += `
+  no pppoe 1
+  [delay 3 detik]
+  pppoe 1 nat enable user ${d.pppoe_user} password ${d.pppoe_password || "zte"}
   firewall enable level low anti-hack disable
   security-mgmt 1 state enable mode forward protocol web
-  wan 1 service internet host 1
+  wan 1 service internet host 1`;
+  }
+
+  cmds += `
 exit`;
+  return cmds;
 }
 
 async function doProvision() {
