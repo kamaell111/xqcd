@@ -35,6 +35,61 @@ class OLTManager:
         self._pending_config: Dict[str, Dict[str, Any]] = {}
         self._pending_guard = threading.Lock()
 
+    # =================== CLEANUP ===================
+    def clear_olt_state(self, olt_id) -> Dict[str, int]:
+        """Bersihkan state in-memory untuk OLT yang dihapus.
+
+        Aman dipanggil sebelum db.delete(olt). Lock yang masih dipegang
+        thread lain tidak akan di-force-release — cukup di-pop dari dict,
+        thread pemegang akan release sendiri, lock baru dibuat kalau ada
+        request baru.
+
+        Returns: dict jumlah yang dibersihkan per kategori.
+        """
+        key = str(olt_id)
+        cleared = {"locks": 0, "thread_locks": 0, "circuit": 0, "pending": 0, "jobs": 0}
+
+        # 1. Locks (asyncio + thread) — pop tanpa acquire
+        self.locks.pop(key, None); cleared["locks"] = 1
+        with self.thread_locks_guard:
+            if self.thread_locks.pop(key, None) is not None:
+                cleared["thread_locks"] = 1
+
+        # 2. Circuit breaker state
+        with self._circuit_guard:
+            if self._circuit.pop(key, None) is not None:
+                cleared["circuit"] = 1
+
+        # 3. Pending config (two-phase commit)
+        with self._pending_guard:
+            if self._pending_config.pop(key, None) is not None:
+                cleared["pending"] = 1
+
+        # 4. Job store — HANYA job yang sudah selesai (success/failed/cancelled).
+        #    Job yang masih running jangan disentuh, biar tidak nyangkut.
+        terminal_status = {"success", "failed", "error", "cancelled", "timeout"}
+        with self.jobs_lock:
+            to_remove = [
+                jid for jid, j in self.jobs.items()
+                if str(j.get("olt_id")) == key
+                and j.get("status") in terminal_status
+            ]
+            for jid in to_remove:
+                self.jobs.pop(jid, None)
+            cleared["jobs"] = len(to_remove)
+
+        # 5. Idempotency map — buang yang olt_id-nya sama dan job-nya sudah tidak ada
+        with self.resources_lock:
+            stale = [
+                rk for rk in list(self.active_resources.keys())
+                if str(rk[0]) == key
+                and self.active_resources[rk] not in self.jobs
+            ]
+            for rk in stale:
+                self.active_resources.pop(rk, None)
+
+        return cleared
+
     # =================== LOCK ===================
     def get_lock(self, olt_id: str) -> asyncio.Lock:
         """Ambil atau buat lock untuk OLT tertentu."""

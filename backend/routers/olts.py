@@ -103,11 +103,14 @@ def delete_olt(olt_id: int, db: Session = Depends(get_db),
     if not olt:
         raise HTTPException(404, "OLT tidak ditemukan")
 
-    # Bersihkan cache koneksi Netmiko sebelum hapus — biar kredensial lama tidak nyangkut
+    # Bersihkan cache koneksi Netmiko + state in-memory sebelum hapus
     from olt_client import evict_connection
     evicted = evict_connection(olt.ip_address, olt.port)
+
+    # Fix #5: bersihkan lock/circuit/pending/jobs terminal dari olt_manager
+    cleared = olt_manager.clear_olt_state(olt_id)
 
     db.delete(olt)
     db.commit()
     audit(db, user.username, "delete_olt", str(olt_id))
-    return {"ok": True, "evicted_connections": evicted}
+    return {"ok": True, "evicted_connections": evicted, "cleared_state": cleared}
