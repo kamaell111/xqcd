@@ -312,39 +312,76 @@ async def _retention_job():
 
 
 async def _startup_full_sync():
-    """Full sync semua OLT sekali saat app nyala — non-blocking."""
+    """Full sync semua OLT sekali saat app nyala — non-blocking.
+
+    Race fix (Fix #2):
+    - Lock di-acquire & release DI DALAM thread worker (bukan coroutine),
+      supaya kalau wait_for timeout, lock tetap dipegang thread sampai selesai.
+    - Session DB dibuat baru per-thread, tidak di-share dengan coroutine.
+    - Snapshot OLT (id, ip) diambil dulu, ORM object tidak dilewatkan ke thread.
+    """
     import asyncio
     import traceback
     print("[STARTUP-SYNC] task dimulai", flush=True)
     try:
         from routers.sync import _do_sync_pons
         from olt_manager import olt_manager
+        from database import SessionLocal
 
+        # 1. Snapshot list OLT di session sendiri (sebentar)
         db = SessionLocal()
         try:
             olts = db.query(OLT).all()
-            print(f"[STARTUP-SYNC] {len(olts)} OLT akan disync", flush=True)
-            for olt in olts:
-                lock = olt_manager.get_thread_lock(str(olt.id))
-                if not lock.acquire(timeout=5):
-                    print(f"[STARTUP-SYNC] {olt.ip_address} sibuk — skip", flush=True)
-                    continue
-                try:
-                    print(f"[STARTUP-SYNC] {olt.ip_address} mulai...", flush=True)
-                    await asyncio.wait_for(
-                        asyncio.to_thread(_do_sync_pons, db, olt),
-                        timeout=300,
-                    )
-                    print(f"[STARTUP-SYNC] {olt.ip_address} OK", flush=True)
-                except asyncio.TimeoutError:
-                    print(f"[STARTUP-SYNC] {olt.ip_address} TIMEOUT (5 menit)", flush=True)
-                except Exception as e:
-                    print(f"[STARTUP-SYNC] {olt.ip_address} gagal: {e}", flush=True)
-                    traceback.print_exc()
-                finally:
-                    lock.release()
+            snapshots = [{"id": o.id, "ip": o.ip_address} for o in olts]
+            print(f"[STARTUP-SYNC] {len(snapshots)} OLT akan disync", flush=True)
         finally:
             db.close()
+
+        # 2. Loop — semua lock & session di dalam thread worker
+        for snap in snapshots:
+            olt_id = snap["id"]
+            ip = snap["ip"]
+
+            def _worker(_oid=olt_id, _ip=ip):
+                thread_db = SessionLocal()
+                try:
+                    t_olt = thread_db.query(OLT).get(_oid)
+                    if not t_olt:
+                        return ("not_found", None)
+                    lock = olt_manager.get_thread_lock(str(_oid))
+                    if not lock.acquire(timeout=5):
+                        return ("busy", None)
+                    try:
+                        print(f"[STARTUP-SYNC] {_ip} mulai...", flush=True)
+                        _do_sync_pons(thread_db, t_olt)
+                        return ("ok", None)
+                    except Exception as e:
+                        return ("err", str(e))
+                    finally:
+                        lock.release()
+                finally:
+                    thread_db.close()
+
+            try:
+                status, err = await asyncio.wait_for(
+                    asyncio.to_thread(_worker), timeout=300
+                )
+                if status == "ok":
+                    print(f"[STARTUP-SYNC] {ip} OK", flush=True)
+                elif status == "busy":
+                    print(f"[STARTUP-SYNC] {ip} sibuk — skip", flush=True)
+                elif status == "err":
+                    print(f"[STARTUP-SYNC] {ip} gagal: {err}", flush=True)
+                elif status == "not_found":
+                    print(f"[STARTUP-SYNC] {ip} tidak ada di DB", flush=True)
+            except asyncio.TimeoutError:
+                # Thread masih jalan — JANGAN release lock di sini.
+                # Lock akan dilepas di finally _worker() saat thread selesai.
+                print(f"[STARTUP-SYNC] {ip} TIMEOUT (5 menit) — thread masih jalan di background, lock akan dilepas otomatis", flush=True)
+            except Exception as e:
+                print(f"[STARTUP-SYNC] {ip} error coroutine: {e}", flush=True)
+                traceback.print_exc()
+
     except Exception as e:
         print(f"[STARTUP-SYNC] FATAL: {e}", flush=True)
         traceback.print_exc()

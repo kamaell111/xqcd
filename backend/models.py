@@ -56,6 +56,11 @@ class OLT(Base):
     vlans = relationship("VLAN", back_populates="olt", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="olt", cascade="all, delete-orphan")
     config_versions = relationship("ConfigVersion", back_populates="olt", cascade="all, delete-orphan")
+    # Fix #3: ONUEvent & MetricHistory tanpa back_populates (tidak dipakai reverse)
+    onu_events = relationship("ONUEvent", cascade="all, delete-orphan",
+                              foreign_keys="ONUEvent.olt_id")
+    metric_history = relationship("MetricHistory", cascade="all, delete-orphan",
+                                  foreign_keys="MetricHistory.olt_id")
 
 
 class PONPort(Base):

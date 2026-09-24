@@ -2,6 +2,7 @@
 from netmiko import ConnectHandler
 from typing import List, Dict
 import re
+import hashlib
 import time as _time
 import threading
 import atexit
@@ -38,9 +39,34 @@ def _cleanup_all():
 atexit.register(_cleanup_all)
 
 
+def _pw_hash(password: str) -> str:
+    """Short hash password untuk cache key — biar beda password = beda entry."""
+    if not password:
+        return "nopass"
+    return hashlib.sha256(password.encode()).hexdigest()[:16]
+
+
+def evict_connection(host: str, port: int, username: str = None):
+    """Tutup + buang koneksi cache untuk (host, port) atau (host, port, username).
+    Panggil setelah edit/hapus OLT supaya kredensial lama tidak dipakai lagi."""
+    with _CONN_LOCK:
+        to_remove = [
+            k for k in list(_CONN_CACHE.keys())
+            if k[0] == host and k[1] == port
+            and (username is None or k[2] == username)
+        ]
+        for key in to_remove:
+            try:
+                _CONN_CACHE[key][0].disconnect()
+            except Exception:
+                pass
+            _CONN_CACHE.pop(key, None)
+    return len(to_remove)
+
+
 def _get_or_create(host, port, username, password, enable_password, protocol, timeout,
                    device_type):
-    key = f"{host}:{port}:{username}"
+    key = (host, port, username, _pw_hash(password))
 
     # Try cache
     with _CONN_LOCK:
