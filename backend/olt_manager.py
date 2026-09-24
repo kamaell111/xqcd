@@ -28,6 +28,12 @@ class OLTManager:
         # Idempotency map: {(olt_id, resource_key): job_id}
         self.active_resources: Dict[tuple, str] = {}
         self.resources_lock = threading.Lock()
+        # Circuit breaker per OLT: {olt_id: {failures, open_until, last_error, open_count}}
+        self._circuit: Dict[str, Dict[str, Any]] = {}
+        self._circuit_guard = threading.Lock()
+        # Pending config changes (two-phase commit): {olt_id: {pending, last_op, last_op_time, last_commit_time}}
+        self._pending_config: Dict[str, Dict[str, Any]] = {}
+        self._pending_guard = threading.Lock()
 
     # =================== LOCK ===================
     def get_lock(self, olt_id: str) -> asyncio.Lock:
@@ -43,6 +49,109 @@ class OLTManager:
             if olt_id not in self.thread_locks:
                 self.thread_locks[olt_id] = threading.Lock()
             return self.thread_locks[olt_id]
+
+    # =================== CIRCUIT BREAKER ===================
+    def record_olt_result(self, olt_id: str, success: bool, error: str = None):
+        """Catat hasil operasi OLT. Kalau gagal berturut-turut → buka circuit."""
+        with self._circuit_guard:
+            state = self._circuit.setdefault(str(olt_id), {
+                "failures": 0, "open_until": 0.0,
+                "last_error": None, "open_count": 0,
+            })
+            if success:
+                if state["failures"] > 0:
+                    print(f"[CIRCUIT] OLT {olt_id} pulih — reset setelah {state['failures']} gagal")
+                state["failures"] = 0
+                state["open_until"] = 0.0
+                state["last_error"] = None
+                state["open_count"] = 0
+            else:
+                state["failures"] += 1
+                state["last_error"] = (error or "")[:200]
+                if state["failures"] >= CIRCUIT_FAIL_THRESHOLD:
+                    idx = min(state["open_count"], len(CIRCUIT_BACKOFF_STEPS) - 1)
+                    backoff = CIRCUIT_BACKOFF_STEPS[idx]
+                    state["open_until"] = time.time() + backoff
+                    state["open_count"] += 1
+                    print(f"[CIRCUIT] OLT {olt_id} OPEN {backoff}s (gagal {state['failures']}x: {state['last_error']})")
+
+    def is_olt_circuit_open(self, olt_id: str):
+        """Return alasan kalau circuit OPEN, None kalau aman."""
+        with self._circuit_guard:
+            state = self._circuit.get(str(olt_id))
+            if not state:
+                return None
+            now = time.time()
+            if state["open_until"] > now:
+                remain = int(state["open_until"] - now)
+                return f"circuit OPEN — tunggu {remain}s (gagal {state['failures']}x terakhir)"
+            return None
+
+    def get_olt_circuit_state(self, olt_id: str) -> dict:
+        """Ambil status circuit untuk ditampilkan di UI."""
+        with self._circuit_guard:
+            state = self._circuit.get(str(olt_id), {
+                "failures": 0, "open_until": 0.0,
+                "last_error": None, "open_count": 0,
+            })
+            now = time.time()
+            is_open = state["open_until"] > now
+            return {
+                "is_open": is_open,
+                "failures": state["failures"],
+                "remain_sec": max(0, int(state["open_until"] - now)) if is_open else 0,
+                "last_error": state["last_error"],
+                "total_opens": state["open_count"],
+            }
+
+    # =================== TWO-PHASE COMMIT STATE ===================
+    def mark_pending(self, olt_id: str, op: str = ""):
+        """Tandai ada perubahan belum di-commit ke flash."""
+        with self._pending_guard:
+            state = self._pending_config.setdefault(str(olt_id), {
+                "pending": False,
+                "last_op": None,
+                "last_op_time": 0.0,
+                "last_commit_time": 0.0,
+                "ops_count": 0,
+            })
+            state["pending"] = True
+            state["last_op"] = op
+            state["last_op_time"] = time.time()
+            state["ops_count"] = state.get("ops_count", 0) + 1
+
+    def mark_committed(self, olt_id: str):
+        """Tandai config sudah di-commit (write sukses)."""
+        with self._pending_guard:
+            state = self._pending_config.setdefault(str(olt_id), {
+                "pending": False,
+                "last_op": None,
+                "last_op_time": 0.0,
+                "last_commit_time": 0.0,
+                "ops_count": 0,
+            })
+            state["pending"] = False
+            state["last_commit_time"] = time.time()
+            state["ops_count"] = 0
+
+    def get_pending_state(self, olt_id: str) -> dict:
+        """Ambil status pending untuk UI."""
+        with self._pending_guard:
+            state = self._pending_config.get(str(olt_id), {
+                "pending": False,
+                "last_op": None,
+                "last_op_time": 0.0,
+                "last_commit_time": 0.0,
+                "ops_count": 0,
+            })
+            now = time.time()
+            return {
+                "pending": state["pending"],
+                "last_op": state["last_op"],
+                "age_sec": max(0, int(now - state["last_op_time"])) if state["last_op_time"] else 0,
+                "last_commit_sec_ago": max(0, int(now - state["last_commit_time"])) if state["last_commit_time"] else None,
+                "ops_count": state.get("ops_count", 0),
+            }
 
     # =================== JOB STORE ===================
     def create_job(self, olt_id: str, job_type: str, resource_key: str = None) -> str:

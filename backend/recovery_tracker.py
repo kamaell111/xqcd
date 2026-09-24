@@ -12,16 +12,27 @@ _LOCK = threading.Lock()
 TTL = 60   # detik — berapa lama disimpan untuk polling frontend
 
 
+DEDUPE_WINDOW = 300   # detik — kalau source sama dalam window ini, skip
+
+
 def add_recovery(olt_id: int, source: str, title: str):
-    """Catat recovery — dipanggil saat alert auto-resolve."""
+    """Catat recovery — dipanggil saat alert auto-resolve.
+    ⭐ Dedupe: kalau source yang sama sudah ada dalam DEDUPE_WINDOW, skip."""
+    now = time.time()
     with _LOCK:
+        # Cek duplikat
+        for r in _RECENT_RECOVERIES:
+            if r["source"] == source and (now - r["ts"]) < DEDUPE_WINDOW:
+                # Sudah ada, update timestamp biar tetap fresh
+                r["ts"] = now
+                r["title"] = title
+                return
         _RECENT_RECOVERIES.append({
             "olt_id": olt_id,
             "source": source,
             "title": title,
-            "ts": time.time(),
+            "ts": now,
         })
-        # Cleanup yang lama
         _cleanup_locked()
 
 

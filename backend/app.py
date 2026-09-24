@@ -3,8 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from datetime import datetime
+import time as _time_mod
 from database import engine, Base, SessionLocal
+from retention import run_retention, log_retention
+from backup import run_backup, log_backup
 from config import settings
 from models import User, OLT, PONPort, ONU, Interface, VLAN, Alert
 from auth import hash_password
@@ -15,6 +19,72 @@ from routers import auth as auth_router
 from routers import olts, monitoring, config, onu, alerts, users, sync, ports, jobs
 
 scheduler = AsyncIOScheduler()
+
+# ⭐ Heartbeat: catat kapan tiap job terakhir sukses
+HEARTBEAT = {
+    "poll_olts": None,
+    "retention": None,
+    "errors": [],   # 20 error terakhir
+}
+
+
+def _job_listener(event):
+    """Log kalau job error — biar nggak silent."""
+    if event.exception:
+        err = {
+            "job": event.job_id,
+            "error": str(event.exception)[:200],
+            "ts": _time_mod.time(),
+        }
+        HEARTBEAT["errors"].append(err)
+        HEARTBEAT["errors"] = HEARTBEAT["errors"][-20:]   # simpan 20 terakhir
+        print(f"[SCHEDULER-ERROR] job={event.job_id} error={event.exception}", flush=True)
+
+
+scheduler.add_listener(_job_listener, EVENT_JOB_ERROR)
+
+
+def migrate_db():
+    """Migration idempotent: pastikan unique index + kolom baru ada.
+    Dipanggil setiap startup, aman kalau sudah ada."""
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        # Bersihkan duplikat VLAN (kalau ada) — keep yang terkecil id-nya
+        try:
+            db.execute(text("""
+                DELETE FROM vlans WHERE id NOT IN (
+                    SELECT MIN(id) FROM vlans GROUP BY olt_id, vlan_id
+                )
+            """))
+        except Exception:
+            pass
+
+        # Unique index VLAN
+        db.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_vlan_unique
+            ON vlans(olt_id, vlan_id)
+        """))
+
+        # Migration kolom User (idempotent)
+        for col_sql in [
+            "ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN full_name TEXT",
+            "ALTER TABLE users ADD COLUMN updated_at DATETIME",
+            "ALTER TABLE onus ADD COLUMN last_dying_gasp DATETIME",
+        ]:
+            try:
+                db.execute(text(col_sql))
+            except Exception:
+                pass
+
+        db.commit()
+        print("[MIGRATE] OK")
+    except Exception as e:
+        db.rollback()
+        print(f"[MIGRATE] Skip: {e}")
+    finally:
+        db.close()
 
 
 def seed_data():
@@ -116,6 +186,12 @@ async def poll_olts():
     try:
         olts = db.query(OLT).all()
         for olt in olts:
+            # ⭐ Cek circuit breaker — skip kalau OLT sedang bermasalah
+            reason = olt_manager.is_olt_circuit_open(str(olt.id))
+            if reason:
+                print(f"[AUTO-SYNC] {olt.ip_address} — {reason}, skip siklus ini")
+                continue
+
             # ⭐ LOCK per OLT — skip kalau sedang dipakai endpoint manual
             lock = olt_manager.get_thread_lock(str(olt.id))
             if not lock.acquire(blocking=False):
@@ -124,6 +200,11 @@ async def poll_olts():
 
             try:
                 await _do_olt_sync(db, olt)
+                success = (olt.status == "online")
+                olt_manager.record_olt_result(str(olt.id), success,
+                                              None if success else "status offline setelah sync")
+            except Exception as e:
+                olt_manager.record_olt_result(str(olt.id), False, str(e)[:200])
             finally:
                 lock.release()
 
@@ -139,6 +220,8 @@ async def poll_olts():
             print(f"[CLEANUP] Jobs: deleted={stats['deleted']}, orphaned={stats['orphaned']}")
     except Exception as e:
         print(f"[CLEANUP] Error: {e}")
+
+    HEARTBEAT["poll_olts"] = _time_mod.time()
 
 
 async def _do_olt_sync(db, olt):
@@ -207,30 +290,133 @@ async def _do_olt_sync(db, olt):
         olt.status = "offline"
 
 
+async def _backup_job():
+    """Job background: backup DB + rotasi tiap 6 jam."""
+    try:
+        stats = run_backup()
+        log_backup(stats)
+    except Exception as e:
+        print(f"[BACKUP] Error: {e}")
+
+
+async def _retention_job():
+    """Job background: hapus data lama + VACUUM."""
+    db = SessionLocal()
+    try:
+        stats = run_retention(db)
+        log_retention(stats)
+    except Exception as e:
+        print(f"[RETENTION] Error: {e}")
+    finally:
+        db.close()
+
+
+async def _startup_full_sync():
+    """Full sync semua OLT sekali saat app nyala — non-blocking."""
+    import asyncio
+    import traceback
+    print("[STARTUP-SYNC] task dimulai", flush=True)
+    try:
+        from routers.sync import _do_sync_pons
+        from olt_manager import olt_manager
+
+        db = SessionLocal()
+        try:
+            olts = db.query(OLT).all()
+            print(f"[STARTUP-SYNC] {len(olts)} OLT akan disync", flush=True)
+            for olt in olts:
+                lock = olt_manager.get_thread_lock(str(olt.id))
+                if not lock.acquire(timeout=5):
+                    print(f"[STARTUP-SYNC] {olt.ip_address} sibuk — skip", flush=True)
+                    continue
+                try:
+                    print(f"[STARTUP-SYNC] {olt.ip_address} mulai...", flush=True)
+                    await asyncio.wait_for(
+                        asyncio.to_thread(_do_sync_pons, db, olt),
+                        timeout=300,
+                    )
+                    print(f"[STARTUP-SYNC] {olt.ip_address} OK", flush=True)
+                except asyncio.TimeoutError:
+                    print(f"[STARTUP-SYNC] {olt.ip_address} TIMEOUT (5 menit)", flush=True)
+                except Exception as e:
+                    print(f"[STARTUP-SYNC] {olt.ip_address} gagal: {e}", flush=True)
+                    traceback.print_exc()
+                finally:
+                    lock.release()
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[STARTUP-SYNC] FATAL: {e}", flush=True)
+        traceback.print_exc()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    migrate_db()
     seed_data()
-    scheduler.add_job(poll_olts, "interval", seconds=settings.SNMP_POLL_INTERVAL)
+    scheduler.add_job(
+        poll_olts, "interval",
+        seconds=settings.SNMP_POLL_INTERVAL,
+        id="poll_olts",
+        max_instances=1,           # jangan stack kalau siklus lambat
+        coalesce=True,             # gabung misfire jadi 1x
+        misfire_grace_time=30,     # toleransi 30s kalau telat
+    )
+    # ⭐ Retention job: hapus data lama tiap 24 jam
+    scheduler.add_job(
+        _retention_job, "interval",
+        hours=24,
+        id="retention",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        _backup_job, "interval",
+        hours=6,
+        id="backup",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=600,
+    )
     scheduler.start()
 
-    # ⭐ Start SNMP Trap receiver
-    from trap_receiver import start_trap_receiver
-    from trap_sync import trigger_light_sync_from_trap
+    # ⭐ Startup full sync — sekali saja, di background
+    asyncio.create_task(_startup_full_sync())
 
-    trap_transport = await start_trap_receiver(trigger_light_sync_from_trap)
-    if trap_transport:
-        print("[APP] SNMP Trap receiver aktif")
+    # ⭐ Start SNMP Trap receiver (opsional, default OFF via ENABLE_SNMP_TRAP)
+    trap_transport = None
+    if settings.ENABLE_SNMP_TRAP:
+        from trap_receiver import start_trap_receiver
+        from trap_sync import trigger_light_sync_from_trap
+
+        trap_transport = await start_trap_receiver(trigger_light_sync_from_trap)
+        if trap_transport:
+            print("[APP] SNMP Trap receiver aktif")
+        else:
+            print("[APP] SNMP Trap receiver TIDAK aktif (port 1620 tidak bisa dibind)")
     else:
-        print("[APP] SNMP Trap receiver TIDAK aktif (port 1620 tidak bisa dibind)")
+        print("[APP] SNMP Trap receiver NONAKTIF (ENABLE_SNMP_TRAP=false)")
 
     yield
 
     # Shutdown
+    print("[APP] Shutdown dimulai...", flush=True)
     if trap_transport:
         trap_transport.close()
         print("[APP] SNMP Trap receiver dimatikan")
-    scheduler.shutdown()
+    scheduler.shutdown(wait=False)
+
+    # ⭐ Tutup semua koneksi Netmiko ke OLT
+    try:
+        from olt_client import _cleanup_all
+        _cleanup_all()
+        print("[APP] Semua koneksi Netmiko ditutup")
+    except Exception as e:
+        print(f"[APP] Cleanup koneksi error (diabaikan): {e}")
+
+    print("[APP] Shutdown selesai", flush=True)
 
 
 app = FastAPI(title=settings.APP_NAME, version="1.0.0", lifespan=lifespan)

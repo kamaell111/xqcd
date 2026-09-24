@@ -8,9 +8,10 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script id="zteolt-theme-early">(function(){try{var s=localStorage.getItem("theme")||"auto";var d=s==="auto"?matchMedia("(prefers-color-scheme: dark)").matches:(s==="dark");document.documentElement.dataset.theme=d?"dark":"light";}catch(e){document.documentElement.dataset.theme="dark";}})();</script>
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="dashboard-a">
 <div id="app">
 
   <!-- LOGIN -->
@@ -49,24 +50,40 @@
   <!-- MAIN -->
   <div id="main-screen" class="main-screen hidden">
 
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="logo">
         <div class="logo-icon"><i class="fas fa-network-wired"></i></div>
-        <span>OLT Manager</span>
+        <span class="logo-text">OLT Manager</span>
+        <button id="sidebar-compact" class="sb-compact" title="Kecilkan sidebar" onclick="toggleSidebarCompact()">
+          <i class="fas fa-angles-left"></i>
+        </button>
       </div>
       <nav>
-        <div class="nav-section">Utama</div>
-        <a href="#" data-page="dashboard" class="active"><i class="fas fa-th-large"></i><span>Dashboard</span></a>
-        <a href="#" data-page="olts"><i class="fas fa-server"></i><span>OLT</span></a>
-        <a href="#" data-page="pons"><i class="fas fa-broadcast-tower"></i><span>PON Ports</span></a>
-        <a href="#" data-page="onus"><i class="fas fa-wifi"></i><span>ONU</span></a>
-        <div class="nav-section">Jaringan</div>
-        <a href="#" data-page="interfaces"><i class="fas fa-ethernet"></i><span>Interfaces</span></a>
-        <a href="#" data-page="vlans"><i class="fas fa-layer-group"></i><span>VLAN</span></a>
-        <div class="nav-section">Sistem</div>
-        <a href="#" data-page="alerts"><i class="fas fa-bell"></i><span>Alerts</span><span id="alert-badge" class="badge">0</span></a>
-        <a href="#" data-page="audit"><i class="fas fa-history"></i><span>Audit Log</span></a>
-        <a href="#" data-page="users"><i class="fas fa-users-cog"></i><span>Users</span></a>
+        <details class="nav-group" open>
+          <summary><span>Overview</span></summary>
+          <a href="#" data-page="dashboard" class="active"><i class="fas fa-th-large"></i><span>Dashboard</span></a>
+          <a href="#" data-page="alerts"><i class="fas fa-bell"></i><span>Alerts</span><span id="alert-badge" class="badge">0</span></a>
+        </details>
+
+        <details class="nav-group" open>
+          <summary><span>FTTH</span></summary>
+          <a href="#" data-page="pons"><i class="fas fa-broadcast-tower"></i><span>PON Ports</span></a>
+          <a href="#" data-page="onus"><i class="fas fa-wifi"></i><span>ONU</span></a>
+          <a href="#" data-page="optical"><i class="fas fa-signal"></i><span>Optical</span></a>
+        </details>
+
+        <details class="nav-group" open>
+          <summary><span>Infrastructure</span></summary>
+          <a href="#" data-page="olts"><i class="fas fa-server"></i><span>OLT</span></a>
+          <a href="#" data-page="interfaces"><i class="fas fa-ethernet"></i><span>Interfaces</span></a>
+          <a href="#" data-page="vlans"><i class="fas fa-layer-group"></i><span>VLAN</span></a>
+        </details>
+
+        <details class="nav-group" open>
+          <summary><span>System</span></summary>
+          <a href="#" data-page="audit"><i class="fas fa-history"></i><span>Audit Log</span></a>
+          <a href="#" data-page="users"><i class="fas fa-users-cog"></i><span>Users</span></a>
+        </details>
       </nav>
       <div class="user-info">
         <div class="user-avatar"><i class="fas fa-user-circle"></i></div>
@@ -74,21 +91,48 @@
           <div id="user-name">-</div>
           <small id="user-role">-</small>
         </div>
+        <button id="change-password-btn" class="btn-icon" title="Ganti Password" onclick="openSelfPasswordChange()"><i class="fas fa-key"></i></button>
         <button id="logout-btn" class="btn-icon" title="Logout"><i class="fas fa-sign-out-alt"></i></button>
       </div>
     </aside>
 
     <main class="content">
       <header class="topbar">
-        <div>
+        <div class="topbar-left">
+          <nav class="topbar-crumb" aria-label="Breadcrumb">
+            <span class="crumb-root">OLT Manager</span>
+            <i class="fas fa-angle-right crumb-sep"></i>
+            <span id="crumb-current">Dashboard</span>
+          </nav>
           <h2 id="page-title">Dashboard</h2>
           <div class="topbar-sub" id="page-subtitle">Ringkasan sistem dan status perangkat</div>
         </div>
+        <div class="topbar-search" id="topbar-search">
+          <div class="search-input-wrap">
+            <i class="fas fa-search"></i>
+            <input type="text" id="global-search" placeholder="Cari SN, nama, PON, VLAN..." autocomplete="off">
+            <kbd class="search-kbd">/</kbd>
+          </div>
+          <div id="global-search-results" class="search-results hidden"></div>
+        </div>
         <div class="topbar-actions">
+          <div id="circuit-pill" class="circuit-pill hidden" title="Status circuit breaker OLT">
+            <i class="fas fa-exclamation-triangle"></i>
+            <span id="circuit-text">DEGRADED</span>
+          </div>
+          <div id="config-pill" class="config-pill hidden" title="Status config OLT" onclick="openConfigCommitPanel()">
+            <i class="fas fa-save"></i>
+            <span id="config-pill-text">Config</span>
+          </div>
+          <div id="freshness-pill" class="freshness-pill" title="Terakhir sync dari OLT">
+            <i class="fas fa-clock"></i>
+            <span id="freshness-text">--</span>
+          </div>
           <div id="olt-status" class="status-pill">
             <span class="dot"></span>
             <span id="olt-status-text">Memuat...</span>
           </div>
+                    <button class="btn-icon theme-toggle" id="theme-toggle" title="Ganti tema (terang/gelap)" onclick="toggleTheme()"><i class="fas fa-sun"></i></button>
           <button class="btn-icon" id="refresh-btn" title="Refresh">
             <i class="fas fa-sync"></i>
           </button>
@@ -99,165 +143,256 @@
 
         <!-- DASHBOARD -->
         <section class="page active" id="page-dashboard">
-          <!-- Hero / OLT overview -->
-          <div class="hero-card" id="hero-card">
-            <div class="hero-bg"></div>
-            <div class="hero-content">
-              <div class="hero-left">
-                <div class="hero-badge"><i class="fas fa-server"></i> OLT</div>
-                <h1 id="hero-hostname">ZXAN</h1>
-                <div class="hero-meta">
-                  <span><i class="fas fa-network-wired"></i> <span id="hero-ip">-</span></span>
-                  <span><i class="fas fa-microchip"></i> <span id="hero-firmware">-</span></span>
-                  <span><i class="fas fa-location-dot"></i> <span id="hero-location">-</span></span>
-                </div>
-              </div>
-              <div class="hero-right">
-                <div class="hero-stat">
-                  <div class="hero-stat-value" id="hero-uptime">-</div>
-                  <div class="hero-stat-label">Uptime</div>
-                </div>
-                <div class="hero-stat">
-                  <div class="hero-stat-value" id="hero-onus">-</div>
-                  <div class="hero-stat-label">ONU Aktif</div>
-                </div>
-                <div class="hero-stat">
-                  <div class="hero-stat-value" id="hero-pons">-</div>
-                  <div class="hero-stat-label">PON Aktif</div>
-                </div>
-              </div>
-            </div>
-          </div>
 
-          <!-- Stat widgets -->
-          <div class="widgets">
-            <div class="widget stat-card" data-accent="blue">
+  <div class="hero-card" id="hero-card">
+    <div class="hero-bg"></div>
+    <div class="hero-content">
+      <div class="hero-left">
+        <div class="hero-badge"><i class="fas fa-server"></i> OLT ZTE C320</div>
+        <h1 id="hero-hostname">ZXAN</h1>
+        <div class="hero-meta">
+          <span title="Alamat manajemen"><i class="fas fa-network-wired"></i> <span id="hero-ip">-</span></span>
+          <span title="Versi firmware"><i class="fas fa-microchip"></i> <span id="hero-firmware">-</span></span>
+          <span title="Lokasi perangkat"><i class="fas fa-location-dot"></i> <span id="hero-location">-</span></span>
+        </div>
+      </div>
+      <div class="hero-right">
+        <div class="hero-stat">
+          <div class="hero-stat-value" id="hero-uptime">-</div>
+          <div class="hero-stat-label">Uptime</div>
+        </div>
+        <div class="hero-stat">
+          <div class="hero-stat-value" id="hero-onus">-</div>
+          <div class="hero-stat-label">ONU aktif</div>
+        </div>
+        <div class="hero-stat">
+          <div class="hero-stat-value" id="hero-pons">-</div>
+          <div class="hero-stat-label">PON aktif</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="widgets">
+    <div class="widget stat-card clickable" data-accent="green" role="button" tabindex="0"
+         title="Lihat ONU online" onclick="gotoFiltered('onus','online')"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoFiltered('onus','online')}">
+      <div class="stat-head">
+        <div class="stat-icon green"><i class="fas fa-check-circle"></i></div>
+        <div class="stat-trend" id="online-trend"></div>
+      </div>
+      <div class="stat-body">
+        <div class="stat-label">ONU online</div>
+        <div class="stat-value" id="stat-online"><span class="skeleton">--</span></div>
+        <div class="stat-sub" id="online-sub">dari -- ONU</div>
+      </div>
+    </div>
+
+    <div class="widget stat-card clickable" data-accent="orange" role="button" tabindex="0"
+         title="Lihat ONU offline" onclick="gotoFiltered('onus','offline')"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoFiltered('onus','offline')}">
+      <div class="stat-head">
+        <div class="stat-icon orange"><i class="fas fa-power-off"></i></div>
+      </div>
+      <div class="stat-body">
+        <div class="stat-label">ONU offline</div>
+        <div class="stat-value" id="stat-offline"><span class="skeleton">--</span></div>
+        <div class="stat-sub" id="offline-sub">Modem mati atau tidak terhubung</div>
+      </div>
+    </div>
+
+    <div class="widget stat-card clickable" data-accent="purple" role="button" tabindex="0"
+         title="Lihat ONU dengan LOS" onclick="gotoFiltered('onus','los')"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoFiltered('onus','los')}">
+      <div class="stat-head">
+        <div class="stat-icon purple"><i class="fas fa-plug"></i></div>
+      </div>
+      <div class="stat-body">
+        <div class="stat-label">ONU LOS</div>
+        <div class="stat-value" id="stat-los"><span class="skeleton">--</span></div>
+        <div class="stat-sub" id="los-sub">Sinyal hilang — cek fiber</div>
+      </div>
+    </div>
+
+    <div class="widget stat-card clickable" data-accent="blue" role="button" tabindex="0"
+         title="Buka halaman alert" onclick="gotoPage('alerts')"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoPage('alerts')}">
+      <div class="stat-head">
+        <div class="stat-icon blue"><i class="fas fa-exclamation-triangle"></i></div>
+      </div>
+      <div class="stat-body">
+        <div class="stat-label">Alert aktif</div>
+        <div class="stat-value" id="stat-alerts"><span class="skeleton">--</span></div>
+        <div class="stat-sub" id="alert-sub">-</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="health-strip">
+    <div class="health-item">
+      <div class="lbl">CPU</div>
+      <div class="val" id="stat-cpu"><span class="skeleton">--</span></div>
+      <div class="stat-bar"><div class="stat-bar-fill" id="cpu-bar"></div></div>
+    </div>
+    <div class="health-item">
+      <div class="lbl">Memory</div>
+      <div class="val" id="stat-mem"><span class="skeleton">--</span></div>
+      <div class="stat-bar"><div class="stat-bar-fill" id="mem-bar"></div></div>
+    </div>
+    <div class="health-item">
+      <div class="lbl">Uptime perangkat</div>
+      <div class="val mono" id="stat-uptime"><span class="skeleton">--</span></div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="widget">
+      <div class="widget-header">
+        <h3><i class="fas fa-broadcast-tower"></i> Port PON</h3>
+        <div class="legend">
+          <span><i class="dot green"></i>Up</span>
+          <span><i class="dot red"></i>Down</span>
+          <span><i class="dot gray"></i>Shutdown</span>
+        </div>
+      </div>
+      <div id="pon-grid" class="pon-grid">
+        <div class="pon-skeleton"></div>
+      </div>
+    </div>
+
+    <div class="widget">
+      <div class="widget-header">
+        <h3><i class="fas fa-chart-line"></i> Beban CPU &amp; memory</h3>
+        <div class="widget-actions">
+          <select id="chart-range" class="chart-range">
+            <option value="1h">1 jam</option>
+            <option value="6h">6 jam</option>
+            <option value="24h" selected>24 jam</option>
+          </select>
+        </div>
+      </div>
+      <div class="chart-container">
+        <canvas id="chart-cpu"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="widget">
+      <div class="widget-header">
+        <h3><i class="fas fa-bell"></i> Alert terbaru</h3>
+        <button class="btn-link" type="button" onclick="document.querySelector('[data-page=alerts]').click()">
+          Buka semua alert <i class="fas fa-arrow-right"></i>
+        </button>
+      </div>
+      <div id="recent-alerts" class="alert-list"></div>
+    </div>
+
+    <div class="widget">
+      <div class="widget-header">
+        <h3><i class="fas fa-signal"></i> Redaman optik ONU</h3>
+        <button class="btn-link" type="button" onclick="document.querySelector('[data-page=onus]').click()">
+          Periksa semua ONU <i class="fas fa-arrow-right"></i>
+        </button>
+      </div>
+      <div id="onu-optical-list" class="onu-optical-list"></div>
+    </div>
+  </div>
+
+  <div class="widget" id="widget-uncfg" style="display:none">
+    <div class="widget-header">
+      <h3><i class="fas fa-exclamation-circle" style="color:var(--amber)"></i> ONU terdeteksi, belum terdaftar</h3>
+      <div class="widget-actions">
+        <button class="btn-link" type="button" onclick="loadUncfg(true)">
+          Pindai ulang <i class="fas fa-sync"></i>
+        </button>
+      </div>
+    </div>
+    <div id="uncfg-list"></div>
+  </div>
+
+</section>
+
+
+        <section class="page" id="page-olts"><div id="olt-list"></div></section>
+        <section class="page" id="page-pons"><div id="pon-detail"></div></section>
+
+        <section class="page" id="page-optical">
+          <div class="widgets" style="margin-bottom:20px">
+            <div class="widget stat-card clickable" data-accent="blue" onclick="gotoOpticalFilter('')">
               <div class="stat-head">
-                <div class="stat-icon blue"><i class="fas fa-microchip"></i></div>
-                <div class="stat-trend" id="cpu-trend"></div>
+                <div class="stat-icon blue"><i class="fas fa-signal"></i></div>
               </div>
               <div class="stat-body">
-                <div class="stat-label">CPU Usage</div>
-                <div class="stat-value" id="stat-cpu">
+                <div class="stat-label">ONU Terukur</div>
+                <div class="stat-value" id="optical-total">
                   <span class="skeleton">--</span>
                 </div>
-                <div class="stat-bar"><div class="stat-bar-fill" id="cpu-bar"></div></div>
+                <div class="stat-sub">punya data RX</div>
               </div>
             </div>
 
-            <div class="widget stat-card" data-accent="green">
-              <div class="stat-head">
-                <div class="stat-icon green"><i class="fas fa-memory"></i></div>
-              </div>
-              <div class="stat-body">
-                <div class="stat-label">Memory</div>
-                <div class="stat-value" id="stat-mem">
-                  <span class="skeleton">--</span>
-                </div>
-                <div class="stat-bar"><div class="stat-bar-fill" id="mem-bar"></div></div>
-              </div>
-            </div>
-
-            <div class="widget stat-card" data-accent="purple">
-              <div class="stat-head">
-                <div class="stat-icon purple"><i class="fas fa-wifi"></i></div>
-              </div>
-              <div class="stat-body">
-                <div class="stat-label">Total ONU</div>
-                <div class="stat-value" id="stat-onus">
-                  <span class="skeleton">--</span>
-                </div>
-                <div class="stat-sub" id="onus-sub">Terdaftar di OLT</div>
-              </div>
-            </div>
-
-            <div class="widget stat-card" data-accent="orange">
+            <div class="widget stat-card clickable" data-accent="orange" onclick="gotoOpticalFilter('warning')">
               <div class="stat-head">
                 <div class="stat-icon orange"><i class="fas fa-exclamation-triangle"></i></div>
               </div>
               <div class="stat-body">
-                <div class="stat-label">Active Alerts</div>
-                <div class="stat-value" id="stat-alerts">
+                <div class="stat-label">RX Warning</div>
+                <div class="stat-value" id="optical-warn">
                   <span class="skeleton">--</span>
                 </div>
-                <div class="stat-sub" id="alert-sub">-</div>
+                <div class="stat-sub">-25 s/d -28 dBm</div>
               </div>
             </div>
-          </div>
 
-          <!-- PON + chart -->
-          <div class="grid-2">
-            <div class="widget">
-              <div class="widget-header">
-                <h3><i class="fas fa-broadcast-tower"></i> Status PON Ports</h3>
-                <div class="legend">
-                  <span><i class="dot green"></i>Up</span>
-                  <span><i class="dot red"></i>Down</span>
-                  <span><i class="dot gray"></i>Shutdown</span>
+            <div class="widget stat-card clickable" data-accent="red" onclick="gotoOpticalFilter('critical')">
+              <div class="stat-head">
+                <div class="stat-icon red" style="background:linear-gradient(135deg,#ef4444,#b91c1c)"><i class="fas fa-times-circle"></i></div>
+              </div>
+              <div class="stat-body">
+                <div class="stat-label">RX Critical</div>
+                <div class="stat-value" id="optical-crit">
+                  <span class="skeleton">--</span>
                 </div>
-              </div>
-              <div id="pon-grid" class="pon-grid">
-                <div class="pon-skeleton"></div>
+                <div class="stat-sub">&lt; -28 dBm</div>
               </div>
             </div>
 
-            <div class="widget">
-              <div class="widget-header">
-                <h3><i class="fas fa-chart-line"></i> CPU & Memory Trend</h3>
-                <div class="widget-actions">
-                  <select id="chart-range" class="chart-range">
-                    <option value="1h">1 Jam</option>
-                    <option value="6h">6 Jam</option>
-                    <option value="24h" selected>24 Jam</option>
-                  </select>
+            <div class="widget stat-card clickable" data-accent="purple" onclick="gotoOpticalWorstRX()">
+              <div class="stat-head">
+                <div class="stat-icon purple"><i class="fas fa-chart-line"></i></div>
+              </div>
+              <div class="stat-body">
+                <div class="stat-label">RX Terburuk</div>
+                <div class="stat-value" id="optical-worst" style="font-size:18px">
+                  <span class="skeleton">--</span>
                 </div>
-              </div>
-              <div class="chart-container">
-                <canvas id="chart-cpu"></canvas>
+                <div class="stat-sub" id="optical-worst-sub">-</div>
               </div>
             </div>
           </div>
 
-          <!-- Alerts + Top ONU -->
-          <div class="grid-2">
-            <div class="widget">
-              <div class="widget-header">
-                <h3><i class="fas fa-bell"></i> Alert Terbaru</h3>
-                <button class="btn-link" onclick="document.querySelector('[data-page=alerts]').click()">
-                  Lihat semua <i class="fas fa-arrow-right"></i>
-                </button>
-              </div>
-              <div id="recent-alerts" class="alert-list"></div>
-            </div>
-
-            <div class="widget">
-              <div class="widget-header">
-                <h3><i class="fas fa-signal"></i> Optical Power ONU</h3>
-                <button class="btn-link" onclick="document.querySelector('[data-page=onus]').click()">
-                  Detail <i class="fas fa-arrow-right"></i>
-                </button>
-              </div>
-              <div id="onu-optical-list" class="onu-optical-list"></div>
-            </div>
+          <div class="toolbar">
+            <select id="optical-filter">
+              <option value="">Semua ONU</option>
+              <option value="critical">Hanya Critical (&lt; -28)</option>
+              <option value="warning">Hanya Warning (-25 s/d -28)</option>
+              <option value="good">Hanya Bagus (&gt; -25)</option>
+            </select>
+            <input type="text" id="optical-search" placeholder="Cari SN / nama / PON..." style="flex:1;min-width:200px;padding:10px 14px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:13px">
           </div>
 
-          <!-- ONU Belum Terdaftar (uncfg) -->
-          <div class="widget" id="widget-uncfg" style="display:none">
-            <div class="widget-header">
-              <h3><i class="fas fa-exclamation-circle" style="color:var(--yellow)"></i> ONU Terdeteksi (Belum Terdaftar)</h3>
-              <button class="btn-link" onclick="loadUncfg(true)">
-                Refresh <i class="fas fa-sync"></i>
-              </button>
-            </div>
-            <div id="uncfg-list"></div>
-          </div>
-
-          <div style="display:none">
-          </div>
+          <div id="optical-table"></div>
         </section>
 
-        <section class="page" id="page-olts"><div id="olt-list"></div></section>
-        <section class="page" id="page-pons"><div id="pon-detail"></div></section>
+        <section class="page" id="page-onu-detail">
+          <div id="onu-detail-content">
+            <div class="widget" style="padding:30px;text-align:center;color:var(--text-dim)">
+              <i class="fas fa-spinner fa-spin" style="font-size:24px"></i>
+              <p style="margin-top:12px">Memuat detail ONU...</p>
+            </div>
+          </div>
+        </section>
 
         <section class="page" id="page-onus">
           <div class="toolbar">

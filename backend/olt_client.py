@@ -70,14 +70,31 @@ def _get_or_create(host, port, username, password, enable_password, protocol, ti
         "port": port,
         "timeout": timeout,
         "conn_timeout": timeout,
+        "banner_timeout": timeout,        # batas tunggu banner awal
         "session_timeout": 120,
+        "read_timeout_override": 60,      # batas baca output tiap command
         "fast_cli": True,
         "global_delay_factor": 1.0,
     }
     if enable_password:
         params["secret"] = enable_password
 
-    conn = ConnectHandler(**params)
+    # ⭐ Retry ConnectHandler 3x dengan backoff (transport error only)
+    conn = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            conn = ConnectHandler(**params)
+            break
+        except Exception as e:
+            last_err = e
+            wait = 2 ** attempt   # 1s, 2s, 4s
+            print(f"[OLT-CONNECT] {host}:{port} attempt {attempt+1}/3 gagal: {e}")
+            if attempt < 2:
+                _time.sleep(wait)
+
+    if conn is None:
+        raise RuntimeError(f"Gagal connect ke {host}:{port} setelah 3x: {last_err}")
 
     if enable_password:
         try:
@@ -166,7 +183,7 @@ class OLTClient:
         finally:
             conn.disconnect()
 
-    def run_config(self, commands: List[str], save: bool = True) -> str:
+    def run_config(self, commands: List[str], save: bool = False) -> str:
         """Kirim command config satu per satu pakai send_command_timing.
         Lebih reliable untuk ZTE ZXAN via Telnet (prompt detection sering timeout)."""
         conn = self._connect()
@@ -212,6 +229,19 @@ class OLTClient:
                     output_lines.append(f"[SAVE ERROR] {e}")
 
             return "\n".join(output_lines)
+        finally:
+            conn.disconnect()
+
+    def commit_config(self) -> str:
+        """Kirim `write` untuk simpan running-config ke startup-config.
+        Dipakai oleh two-phase commit (operasi destruktif)."""
+        conn = self._connect()
+        try:
+            out = conn.send_command_timing(
+                "write", read_timeout=60, last_read=LAST_READ_LONG,
+                strip_prompt=False, strip_command=False,
+            )
+            return out
         finally:
             conn.disconnect()
 

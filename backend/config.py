@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     SNMP_POLL_INTERVAL: int = 60
     SNMP_TIMEOUT: int = 3
     SNMP_RETRIES: int = 2
+    ENABLE_SNMP_TRAP: bool = False   # default OFF — clone-and-run tanpa setup
 
     # Alert thresholds
     ALERT_CPU_WARNING: float = 85.0
@@ -17,6 +18,15 @@ class Settings(BaseSettings):
     ALERT_OPTICAL_RX_WARNING: float = -25.0     # dBm (makin negatif = makin lemah)
     ALERT_OPTICAL_RX_CRITICAL: float = -28.0    # dBm
     ALERT_AUTO_RESOLVE: bool = True
+
+    # VLAN yang dipakai untuk manajemen OLT — tidak boleh dihapus dari UI
+    # Kosongkan kalau tidak ada
+    MANAGEMENT_VLAN: int = 0
+
+    # DyingGasp — sinyal ONU sebelum mati total (kemungkinan pelanggan cabut adaptor).
+    # false (default) = tidak alert untuk dying_gasp (kurangi noise)
+    # true = alert "info" saat mendeteksi dying_gasp
+    ALERT_DYING_GASP: bool = False
 
     # =================== Seed data ===================
     # User default aplikasi

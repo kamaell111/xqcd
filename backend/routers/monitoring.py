@@ -3,9 +3,10 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
 from database import get_db
-from models import OLT, PONPort, ONU, Interface, User, Alert
+from models import OLT, PONPort, ONU, Interface, User, Alert, ONUEvent
 from schemas import PONPortOut, ONUOut
 from auth import get_current_user
+from olt_manager import olt_manager
 
 router = APIRouter(prefix="/api/v1/olts", tags=["monitoring"])
 
@@ -32,6 +33,7 @@ async def olt_status(olt_id: int, db: Session = Depends(get_db),
         "active_alerts": db.query(Alert).filter(
             Alert.olt_id == olt_id, Alert.resolved == False
         ).count(),
+        "circuit": olt_manager.get_olt_circuit_state(str(olt_id)),
     }
 
 
@@ -64,6 +66,32 @@ def get_onu(olt_id: int, onu_id: int, db: Session = Depends(get_db),
     if not onu:
         raise HTTPException(404, "ONU tidak ditemukan")
     return onu
+
+
+@router.get("/{olt_id}/onus/{onu_id}/events")
+def get_onu_events(olt_id: int, onu_id: int, limit: int = 50,
+                   db: Session = Depends(get_db),
+                   user: User = Depends(get_current_user)):
+    """Timeline event ONU — status change + pppoe change."""
+    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    if not onu:
+        raise HTTPException(404, "ONU tidak ditemukan")
+    events = (db.query(ONUEvent)
+                .filter(ONUEvent.olt_id == olt_id, ONUEvent.onu_id == onu_id)
+                .order_by(ONUEvent.created_at.desc())
+                .limit(limit)
+                .all())
+    return [
+        {
+            "id": e.id,
+            "event_type": e.event_type,
+            "old_value": e.old_value,
+            "new_value": e.new_value,
+            "detail": e.detail,
+            "created_at": e.created_at.isoformat() + "Z" if e.created_at else None,
+        }
+        for e in events
+    ]
 
 
 @router.get("/{olt_id}/interfaces")

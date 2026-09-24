@@ -19,7 +19,10 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(403, "User tidak aktif")
     user.last_login = datetime.utcnow()
     db.commit()
-    token = create_access_token({"sub": user.username, "priv": user.privilege, "role": user.role})
+    token = create_access_token(
+        {"sub": user.username, "priv": user.privilege, "role": user.role},
+        token_version=user.token_version or 0,
+    )
     audit(db, user.username, "login", "auth", "success", "success", request.client.host)
     return Token(access_token=token, user={
         "id": user.id, "username": user.username,

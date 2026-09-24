@@ -58,5 +58,6 @@ htmlcov/
 *.bak*
 *.orig
 
-# Env variants (.env.lan, .env.home, dll)
+# Env variants (.env.lan, .env.home, dll) — TAPI JANGAN .env.example
 .env.*
+!.env.example

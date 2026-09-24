@@ -17,20 +17,38 @@ class LoginRequest(BaseModel):
 class UserCreate(BaseModel):
     username: str
     password: str
-    privilege: int = 5
+    full_name: Optional[str] = None
     role: str = "viewer"
 
 
 class UserOut(BaseModel):
     id: int
     username: str
+    full_name: Optional[str] = None
     privilege: int
     role: str
     is_active: bool
     last_login: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class PasswordReset(BaseModel):
+    new_password: str
+
+
+class PasswordSelfChange(BaseModel):
+    old_password: str
+    new_password: str
 
 
 class OLTCreate(BaseModel):
@@ -92,7 +110,12 @@ class ONUOut(BaseModel):
     distance: Optional[int] = None
     user_vlan: Optional[int] = None
     vlan: Optional[int] = None
+    tcont: Optional[str] = None
+    gemport: Optional[int] = None
+    service_port: Optional[int] = None
+    description: Optional[str] = None
     pppoe_user: Optional[str] = None
+    pppoe_nat: Optional[bool] = False
     pppoe_status: Optional[str] = "unknown"
     pppoe_online_duration: Optional[int] = 0
     internet_checked_at: Optional[datetime] = None
@@ -114,6 +137,7 @@ class ONUProvisionRequest(BaseModel):
     onu_id: int
     serial_number: str
     name: str
+    description: Optional[str] = None    # Site Location / ODP
     onu_type: str = "F609"
     tcont_profile: str = "1G"
     tcont_name: str = "PON1"
@@ -166,3 +190,9 @@ class PortToggleRequest(BaseModel):
     port_type: str      # "gpon" | "uplink"
     port_name: str      # "1/1/1" atau "gei_1/3/1"
     action: str         # "enable" | "disable"
+
+class PortVLANEditRequest(BaseModel):
+    port_name: str              # "gei_1/3/3"
+    mode: str                   # "access" | "trunk" | "hybrid"
+    native_vlan: int = 1        # PVID
+    tag_vlans: str = ""         # "1-2,15,101"

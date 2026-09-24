@@ -32,14 +32,24 @@ def _do_light_sync_by_ip(olt_ip: str):
             print(f"[TRAP-SYNC] OLT {olt_ip} tidak ada di DB — skip")
             return
 
+        # Cek circuit breaker
+        reason = olt_manager.is_olt_circuit_open(str(olt.id))
+        if reason:
+            print(f"[TRAP-SYNC] OLT {olt.ip_address} — {reason}, skip")
+            return
+
         # Reuse lock yang sama dengan endpoint & scheduler
         lock = olt_manager.get_thread_lock(str(olt.id))
         if not lock.acquire(timeout=15):
-            print(f"[TRAP-SYNC] OLT {olt_id} sibuk — skip trap sync")
+            print(f"[TRAP-SYNC] OLT {olt.id} sibuk — skip trap sync")
             return
 
         try:
             _do_light_sync(db, olt)
+            olt_manager.record_olt_result(str(olt.id), True)
+        except Exception as e:
+            olt_manager.record_olt_result(str(olt.id), False, str(e)[:200])
+            raise
         finally:
             lock.release()
     except Exception as e:
@@ -103,7 +113,9 @@ def _do_light_sync(db, olt: OLT):
                 new_status = "online"
             elif phase == "los":
                 new_status = "los"           # ⭐ fiber putus, modem masih nyala
-            elif phase in ("offline", "dying-gasp"):
+            elif phase == "dying-gasp":
+                new_status = "dying_gasp"
+            elif phase == "offline":
                 new_status = "offline"       # ⭐ modem mati total
             elif phase in ("configuring", "initial"):
                 new_status = "configuring"
@@ -114,9 +126,16 @@ def _do_light_sync(db, olt: OLT):
             new_status = "offline"
 
         if onu.status != new_status:
+            # ⭐ Catat event sebelum ubah status
+            from event_log import log_onu_event
+            log_onu_event(db, olt.id, onu, "status_change",
+                          old_value=onu.status, new_value=new_status,
+                          detail="via trap")
             onu.status = new_status
             onu.updated_at = datetime.utcnow()
             changed += 1
+            if new_status == "dying_gasp":
+                onu.last_dying_gasp = datetime.utcnow()
 
             # Kalau ONU offline ATAU LOS → PPPoE = disconnected
             # (LOS = fiber putus, OLT tidak bisa monitor ONU, internet pasti mati)

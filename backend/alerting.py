@@ -113,18 +113,44 @@ def check_onu_alerts(db: Session, olt_id: int, onu) -> list:
     onu_label = onu.serial_number or onu.interface_name or f"onu-{onu.onu_id}"
     source = f"onu:{onu_label}"
 
+    status_lower = (onu.status or "").lower()
+
+    # 0. DyingGasp — kemungkinan pelanggan cabut adaptor. Suppress by default.
+    if status_lower == "dying_gasp":
+        if getattr(settings, "ALERT_DYING_GASP", False):
+            r = process_alert(
+                db, olt_id=olt_id, category="onu_dying_gasp",
+                source=source, severity="info",
+                title=f"ONU {onu_label} mati daya",
+                message="Sinyal dying-gasp — kemungkinan pelanggan cabut adaptor / listrik padam.",
+                condition_active=True,
+            )
+            results.append(("onu_dying_gasp", r))
+        return results
+
     # 1. ONU offline / LOS / CONFIGURING — bedakan pesan
     is_down = onu.status not in ("online", "up", "working")
-    status_lower = (onu.status or "").lower()
 
     if status_lower == "los":
         alert_title = f"ONU {onu_label} LOS"
         alert_msg = "Fiber optik terputus / tidak ada sinyal. Cek kabel fiber & konektor."
         alert_sev = "critical"
     elif status_lower == "offline":
-        alert_title = f"ONU {onu_label} offline"
-        alert_msg = "Modem mati / tidak terhubung ke OLT. Cek power & kabel LAN modem."
-        alert_sev = "critical"
+        # Cek apakah baru saja dying_gasp (dalam 10 menit) → kemungkinan cabut adaptor
+        recent_dying = False
+        try:
+            if onu.last_dying_gasp:
+                recent_dying = (datetime.utcnow() - onu.last_dying_gasp).total_seconds() < 600
+        except Exception:
+            pass
+        if recent_dying:
+            alert_title = f"ONU {onu_label} offline — kemungkinan cabut adaptor"
+            alert_msg = "ONU baru saja mengirim dying-gasp. Kemungkinan pelanggan cabut adaptor / listrik padam."
+            alert_sev = "info"
+        else:
+            alert_title = f"ONU {onu_label} offline"
+            alert_msg = "Modem mati / tidak terhubung ke OLT. Cek power & kabel LAN modem."
+            alert_sev = "critical"
     elif status_lower == "configuring":
         alert_title = f"ONU {onu_label} configuring"
         alert_msg = "ONU sedang proses registrasi ke OLT."

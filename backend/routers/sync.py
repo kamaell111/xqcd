@@ -438,17 +438,13 @@ def _parse_attenuation(output: str) -> dict:
     return r
 
 
-@router.post("/{olt_id}/sync-pons")
-@olt_locked
-def sync_pons(olt_id: int, db: Session = Depends(get_db),
-              user: User = Depends(get_current_user)):
-    """Sync status 16 PON port + list ONU dari OLT (versi cepat)."""
+def _do_sync_pons(db: Session, olt: OLT) -> dict:
+    """Core sync PON + ONU — dipakai endpoint DAN scheduler.
+    Raise Exception kalau gagal. Caller yang handle commit + audit."""
     from models import PONPort, ONU
+    from olt_manager import olt_manager   # fix: import untuk cek active job
 
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
+    olt_id = olt.id
     client = _make_client(olt)
     optical_map = {}    # {onu_index: {"rx": ..., "tx": ...}}
     pppoe_map = {}      # {onu_index: {"status": ..., "online_duration": ..., "username": ...}}
@@ -495,8 +491,7 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
         finally:
             conn.disconnect()
     except Exception as e:
-        audit(db, user.username, "sync_pons", str(olt_id), str(e), "failed")
-        raise HTTPException(500, f"Gagal sync PON: {e}")
+        raise RuntimeError(f"Gagal sync PON: {e}") from e
 
     # Parse admin state dari running-config
     cfg_ports = _parse_gpon_ports_from_config(running_cfg)
@@ -549,7 +544,9 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
             new_status = "online"
         elif phase == "los":
             new_status = "los"
-        elif phase in ("offline", "dying-gasp"):
+        elif phase == "dying-gasp":
+            new_status = "dying_gasp"
+        elif phase == "offline":
             new_status = "offline"
         elif phase in ("configuring", "initial"):
             new_status = "configuring"
@@ -588,11 +585,18 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
 
         # ONU sudah ada di DB — update status & data
         if onu.status != new_status:
+            # ⭐ Catat event sebelum ubah status
+            from event_log import log_onu_event
+            log_onu_event(db, olt_id, onu, "status_change",
+                          old_value=onu.status, new_value=new_status)
             onu.status = new_status
-            # ⭐ Kalau offline/LOS → reset PPPoE juga
-            if new_status in ("offline", "los"):
+            # ⭐ Kalau offline/LOS/dying_gasp → reset PPPoE juga
+            if new_status in ("offline", "los", "dying_gasp"):
                 onu.pppoe_status = "disconnected"
                 onu.pppoe_online_duration = 0
+            # Catat waktu dying_gasp untuk suppression alert offline
+            if new_status == "dying_gasp":
+                onu.last_dying_gasp = datetime.utcnow()
         onu.updated_at = datetime.utcnow()
 
         # Pakai optical yang sudah diambil di koneksi utama
@@ -710,8 +714,6 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
 
     db.commit()
 
-    audit(db, user.username, "sync_pons", str(olt_id))
-
     return {
         "ok": True,
         "pons": [
@@ -731,3 +733,21 @@ def sync_pons(olt_id: int, db: Session = Depends(get_db),
                            if port_infos.get(f"1/1/{i}", {}).get("status") == "up"),
         },
     }
+
+@router.post("/{olt_id}/sync-pons")
+@olt_locked
+def sync_pons(olt_id: int, db: Session = Depends(get_db),
+              user: User = Depends(get_current_user)):
+    """Sync status 16 PON port + list ONU dari OLT (endpoint manual)."""
+    olt = db.query(OLT).get(olt_id)
+    if not olt:
+        raise HTTPException(404, "OLT tidak ditemukan")
+    try:
+        result = _do_sync_pons(db, olt)
+        audit(db, user.username, "sync_pons", str(olt_id))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        audit(db, user.username, "sync_pons", str(olt_id), str(e), "failed")
+        raise HTTPException(500, f"Gagal sync PON: {e}")

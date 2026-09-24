@@ -84,9 +84,14 @@ class ONUConfigGenerator:
     def _base_service_l12(self) -> List[str]:
         """Layer 1/2 dasar — tcont, gemport, service-port, bridge VLAN."""
         r = self.req
-        return [
+        cmds = [
             f"interface {self.iface}",
             f"name {r.name}",
+        ]
+        desc = getattr(r, "description", None)
+        if desc:
+            cmds.append(f"description {desc}")
+        cmds += [
             "sn-bind enable sn",
             f"tcont 1 name {r.tcont_name} profile {r.tcont_profile}",
             f"gemport {r.gemport_id} tcont 1",
@@ -94,6 +99,7 @@ class ONUConfigGenerator:
             f"service-port {r.service_port} vport {r.vport} user-vlan {r.user_vlan} vlan {r.vlan}",
             "exit",
         ]
+        return cmds
 
     def _bridge_pon_mng(self) -> List[str]:
         """pon-onu-mng bagian bridge — service + VLAN tag ke port LAN (STANDAR)."""

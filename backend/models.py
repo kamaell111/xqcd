@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime, Float,
-    ForeignKey, Text, JSON,
+    ForeignKey, Text, JSON, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -12,10 +12,13 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String(64), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
+    full_name = Column(String(128), nullable=True)
     privilege = Column(Integer, default=5)
     role = Column(String(32), default="viewer")
     is_active = Column(Boolean, default=True)
+    token_version = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
     last_login = Column(DateTime, nullable=True)
 
 
@@ -102,8 +105,25 @@ class ONU(Base):
     internet_checked_at = Column(DateTime, nullable=True)
     last_online = Column(DateTime, nullable=True)
     last_offline = Column(DateTime, nullable=True)
+    last_dying_gasp = Column(DateTime, nullable=True)   # untuk suppress offline alert setelah dying_gasp
     updated_at = Column(DateTime, default=datetime.utcnow)
     olt = relationship("OLT", back_populates="onus")
+
+
+class ONUEvent(Base):
+    """Event log ONU — hanya catat saat status BERUBAH.
+    Tujuan: hindari DB bengkak karena polling tiap 15s."""
+    __tablename__ = "onu_events"
+    id = Column(Integer, primary_key=True)
+    olt_id = Column(Integer, ForeignKey("olts.id"), nullable=False, index=True)
+    onu_id = Column(Integer, nullable=False, index=True)
+    pon_port = Column(String(16), nullable=False)
+    serial_number = Column(String(32), index=True)
+    event_type = Column(String(32), nullable=False)   # status_change|pppoe_change
+    old_value = Column(String(32), nullable=True)
+    new_value = Column(String(32), nullable=True)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class Interface(Base):
@@ -134,6 +154,9 @@ class Interface(Base):
 
 class VLAN(Base):
     __tablename__ = "vlans"
+    __table_args__ = (
+        UniqueConstraint('olt_id', 'vlan_id', name='uq_vlan_olt_vlan'),
+    )
     id = Column(Integer, primary_key=True)
     olt_id = Column(Integer, ForeignKey("olts.id"), nullable=False)
     vlan_id = Column(Integer, nullable=False)

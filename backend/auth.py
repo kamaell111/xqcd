@@ -24,11 +24,20 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: dict, token_version: int = 0, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "v": token_version})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def bump_token_version(db, user) -> int:
+    """Naikkan token_version user — invalidate semua token lama.
+    Dipanggil saat: ganti password, nonaktif, ubah role."""
+    user.token_version = (user.token_version or 0) + 1
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    return user.token_version
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
@@ -44,6 +53,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise cred_exc
     user = db.query(User).filter(User.username == username).first()
     if not user or not user.is_active:
+        raise cred_exc
+    # ⭐ Cek token_version — invalidate token kalau user ganti password / nonaktif
+    token_ver = payload.get("v", 0)
+    if (user.token_version or 0) != token_ver:
         raise cred_exc
     return user
 
