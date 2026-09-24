@@ -2,7 +2,7 @@
 const API = "/api/v1";
 let TOKEN = localStorage.getItem("token") || null;
 let CURRENT_USER = JSON.parse(localStorage.getItem("user") || "null");
-let CURRENT_OLT_ID = 1;
+let CURRENT_OLT_ID = parseInt(localStorage.getItem("olt_id") || "0", 10) || null;
 let refreshTimer = null;
 let recoveryTimer = null;
 let lastRecoveryTs = 0;   // track timestamp recovery terakhir
@@ -87,7 +87,7 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
     CURRENT_USER = res.user;
     localStorage.setItem("token", TOKEN);
     localStorage.setItem("user", JSON.stringify(CURRENT_USER));
-    showApp();
+    await showApp();
   } catch (ex) {
     err.textContent = ex.message;
   } finally {
@@ -113,7 +113,28 @@ function logout() {
 
 document.getElementById("logout-btn").addEventListener("click", logout);
 
-function showApp() {
+async function initCurrentOltId() {
+  try {
+    const olts = await api("/olts");
+    if (!olts.length) {
+      CURRENT_OLT_ID = null;
+      localStorage.removeItem("olt_id");
+      console.warn("[OLT] tidak ada OLT terdaftar");
+      return null;
+    }
+    const saved = parseInt(localStorage.getItem("olt_id") || "0", 10);
+    const found = olts.find(o => o.id === saved);
+    CURRENT_OLT_ID = found ? found.id : olts[0].id;
+    localStorage.setItem("olt_id", String(CURRENT_OLT_ID));
+    console.log(`[OLT] aktif: id=${CURRENT_OLT_ID}`);
+    return CURRENT_OLT_ID;
+  } catch (e) {
+    console.warn("[OLT] initCurrentOltId gagal:", e);
+    return null;
+  }
+}
+
+async function showApp() {
   document.getElementById("login-screen").classList.add("hidden");
   document.getElementById("main-screen").classList.remove("hidden");
   document.getElementById("user-name").textContent = CURRENT_USER.username;
@@ -126,6 +147,14 @@ function showApp() {
   if (CURRENT_USER.privilege < 10) {
     const a = document.querySelector('[data-page="audit"]');
     if (a) a.style.display = "none";
+  }
+
+  await initCurrentOltId();
+
+  if (CURRENT_OLT_ID == null) {
+    toast("Tidak ada OLT terdaftar. Tambahkan OLT di menu OLT Management.", "warning");
+    loadPage("olts");
+    return;
   }
 
   loadPage("dashboard");
@@ -2738,7 +2767,7 @@ async function init() {
       const me = await api("/auth/me");
       CURRENT_USER = { ...CURRENT_USER, ...me };
       localStorage.setItem("user", JSON.stringify(CURRENT_USER));
-      showApp();
+      await showApp();
     } catch {
       logout();
     }
