@@ -9,6 +9,7 @@ from auth import get_current_user, require_privilege, audit
 from config import settings
 from olt_client import OLTClient
 from olt_manager import olt_locked, olt_manager
+from tenancy import require_olt_access
 from zxan_parser import parse_running_config
 
 router = APIRouter(prefix="/api/v1/olts", tags=["config"])
@@ -60,11 +61,9 @@ def _make_client(olt: OLT) -> OLTClient:
 
 
 @router.get("/{olt_id}/config")
-def get_running_config(olt_id: int, db: Session = Depends(get_db),
+def get_running_config(db: Session = Depends(get_db),
+                       olt: OLT = Depends(require_olt_access),
                        user: User = Depends(get_current_user)):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     client = _make_client(olt)
     try:
         raw = client.get_running_config()
@@ -75,12 +74,10 @@ def get_running_config(olt_id: int, db: Session = Depends(get_db),
 
 
 @router.post("/{olt_id}/config/preview")
-def preview_config(olt_id: int, req: ConfigPreviewRequest,
+def preview_config(req: ConfigPreviewRequest,
                    db: Session = Depends(get_db),
+                   olt: OLT = Depends(require_olt_access),
                    user: User = Depends(get_current_user)):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     client = _make_client(olt)
     result = client.validate_commands(req.commands)
     return {"commands": req.commands, "validation": result}
@@ -88,12 +85,10 @@ def preview_config(olt_id: int, req: ConfigPreviewRequest,
 
 @router.post("/{olt_id}/config/apply")
 @olt_locked
-def apply_config(olt_id: int, req: ConfigApplyRequest,
+def apply_config(req: ConfigApplyRequest,
                  db: Session = Depends(get_db),
+                 olt: OLT = Depends(require_olt_access),
                  user: User = Depends(require_privilege(15))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     client = _make_client(olt)
     val = client.validate_commands(req.commands)
     if not val["valid"]:
@@ -122,22 +117,20 @@ def apply_config(olt_id: int, req: ConfigApplyRequest,
 
 
 @router.get("/{olt_id}/config/versions")
-def list_versions(olt_id: int, db: Session = Depends(get_db),
+def list_versions(db: Session = Depends(get_db),
+                  olt: OLT = Depends(require_olt_access),
                   user: User = Depends(get_current_user)):
     versions = db.query(ConfigVersion).filter(
-        ConfigVersion.olt_id == olt_id
+        ConfigVersion.olt_id == olt.id
     ).order_by(ConfigVersion.created_at.desc()).all()
     return [{"id": v.id, "version": v.version, "author": v.author,
              "comment": v.comment, "created_at": v.created_at} for v in versions]
 
 
 @router.get("/{olt_id}/vlans")
-def list_vlans(olt_id: int, db: Session = Depends(get_db),
+def list_vlans(db: Session = Depends(get_db),
+               olt: OLT = Depends(require_olt_access),
                user: User = Depends(get_current_user)):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
     # Sync VLAN dari OLT dulu
     client = _make_client(olt)
 
@@ -156,13 +149,13 @@ def list_vlans(olt_id: int, db: Session = Depends(get_db),
             raise RuntimeError("OLT returned empty VLAN list — skip sync to prevent DB wipe")
 
         # Bandingkan dengan DB
-        db_vlans = {v.vlan_id: v for v in db.query(VLAN).filter(VLAN.olt_id == olt_id).all()}
+        db_vlans = {v.vlan_id: v for v in db.query(VLAN).filter(VLAN.olt_id == olt.id).all()}
 
         # Tambah yang ada di OLT tapi belum di DB
         for vid in olt_vlan_ids:
             if vid not in db_vlans:
                 print(f"[VLAN SYNC] Tambah VLAN {vid} dari OLT")
-                db.add(VLAN(olt_id=olt_id, vlan_id=vid, name=f"VLAN{vid}"))
+                db.add(VLAN(olt_id=olt.id, vlan_id=vid, name=f"VLAN{vid}"))
 
         # Hapus dari DB yang sudah tidak ada di OLT
         for vid, v in db_vlans.items():
@@ -174,7 +167,7 @@ def list_vlans(olt_id: int, db: Session = Depends(get_db),
     except Exception as e:
         print(f"[VLAN SYNC] {e}")
 
-    vlans = db.query(VLAN).filter(VLAN.olt_id == olt_id).order_by(VLAN.vlan_id).all()
+    vlans = db.query(VLAN).filter(VLAN.olt_id == olt.id).order_by(VLAN.vlan_id).all()
     return [{"id": v.id, "vlan_id": v.vlan_id, "name": v.name,
              "description": v.description} for v in vlans]
 
@@ -195,7 +188,7 @@ def _do_create_vlan(olt_id: int, req_dict: dict, db: Session, username: str,
     olt = db.query(OLT).get(olt_id)
     if not olt:
         raise RuntimeError("OLT tidak ditemukan")
-    if db.query(VLAN).filter(VLAN.olt_id == olt_id, VLAN.vlan_id == req.vlan_id).first():
+    if db.query(VLAN).filter(VLAN.olt_id == olt.id, VLAN.vlan_id == req.vlan_id).first():
         raise RuntimeError("VLAN sudah ada di database")
 
     client = _make_client(olt)
@@ -267,21 +260,19 @@ def _do_create_vlan(olt_id: int, req_dict: dict, db: Session, username: str,
 
 
 @router.post("/{olt_id}/vlans")
-def create_vlan(olt_id: int, req: VLANCreate,
+def create_vlan(req: VLANCreate,
                 background_tasks: BackgroundTasks,
                 db: Session = Depends(get_db),
+                olt: OLT = Depends(require_olt_access),
                 user: User = Depends(require_privilege(10))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     resource_key = f"create_vlan:{req.vlan_id}"
     job_id, is_new = olt_manager.create_job_atomic(
-        olt_id=str(olt_id), job_type="create_vlan", resource_key=resource_key,
+        olt_id=str(olt.id), job_type="create_vlan", resource_key=resource_key,
     )
     if not is_new:
         return {"job_id": job_id, "status": "queued", "duplicate": True}
     background_tasks.add_task(
-        _run_create_vlan_job, job_id=job_id, olt_id=olt_id,
+        _run_create_vlan_job, job_id=job_id, olt_id=olt.id,
         req_dict=req.model_dump() if hasattr(req, "model_dump") else req.dict(),
         username=user.username,
     )
@@ -304,11 +295,9 @@ def _run_create_vlan_job(job_id: str, olt_id: int, req_dict: dict, username: str
 
 @router.post("/{olt_id}/vlans_legacy_disabled")
 @olt_locked
-def _legacy_create_vlan_disabled(olt_id: int, req: VLANCreate, db: Session = Depends(get_db),
+def _legacy_create_vlan_disabled(req: VLANCreate, db: Session = Depends(get_db),
+                olt: OLT = Depends(require_olt_access),
                 user: User = Depends(require_privilege(10))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     if db.query(VLAN).filter(VLAN.olt_id == olt_id, VLAN.vlan_id == req.vlan_id).first():
         raise HTTPException(400, "VLAN sudah ada")
 
@@ -407,13 +396,11 @@ def _find_vlan_dependencies(db, olt_id: int, vlan_id: int) -> dict:
 
 
 @router.get("/{olt_id}/vlans/{vlan_id}/dependencies")
-def get_vlan_dependencies(olt_id: int, vlan_id: int, db: Session = Depends(get_db),
+def get_vlan_dependencies(vlan_id: int, db: Session = Depends(get_db),
+                          olt: OLT = Depends(require_olt_access),
                           user: User = Depends(get_current_user)):
     """Cek siapa saja yang pakai VLAN ini sebelum dihapus."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    return _find_vlan_dependencies(db, olt_id, vlan_id)
+    return _find_vlan_dependencies(db, olt.id, vlan_id)
 
 
 def _do_delete_vlan(olt_id: int, vlan_id: int, force: bool, db: Session,
@@ -481,18 +468,16 @@ def delete_vlan(olt_id: int, vlan_id: int,
                 force: bool = False,
                 background_tasks: BackgroundTasks = None,
                 db: Session = Depends(get_db),
+                olt: OLT = Depends(require_olt_access),
                 user: User = Depends(require_privilege(10))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     resource_key = f"delete_vlan:{vlan_id}"
     job_id, is_new = olt_manager.create_job_atomic(
-        olt_id=str(olt_id), job_type="delete_vlan", resource_key=resource_key,
+        olt_id=str(olt.id), job_type="delete_vlan", resource_key=resource_key,
     )
     if not is_new:
         return {"job_id": job_id, "status": "queued", "duplicate": True}
     background_tasks.add_task(
-        _run_delete_vlan_job, job_id=job_id, olt_id=olt_id,
+        _run_delete_vlan_job, job_id=job_id, olt_id=olt.id,
         vlan_id=vlan_id, force=force, username=user.username,
     )
     return {"job_id": job_id, "status": "queued", "message": "Job delete VLAN dimulai"}
@@ -517,16 +502,14 @@ def _run_delete_vlan_job(job_id: str, olt_id: int, vlan_id: int, force: bool, us
 def _legacy_delete_vlan_disabled(olt_id: int, vlan_id: int,
                 force: bool = False,
                 db: Session = Depends(get_db),
+                olt: OLT = Depends(require_olt_access),
                 user: User = Depends(require_privilege(10))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    v = db.query(VLAN).filter(VLAN.olt_id == olt_id, VLAN.vlan_id == vlan_id).first()
+    v = db.query(VLAN).filter(VLAN.olt_id == olt.id, VLAN.vlan_id == vlan_id).first()
     if not v:
         raise HTTPException(404, "VLAN tidak ditemukan")
 
     # ⭐ GUARD: cek dependency sebelum hapus
-    deps = _find_vlan_dependencies(db, olt_id, vlan_id)
+    deps = _find_vlan_dependencies(db, olt.id, vlan_id)
 
     if deps["is_management"]:
         raise HTTPException(400, {
