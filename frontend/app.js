@@ -17,7 +17,7 @@ let _inventoryCache = null;   // cache inventory (VLAN, T-CONT, ONU type)
 async function api(path, opts = {}) {
   // Phase B: guard kalau CURRENT_OLT_ID null
   if (path.includes("/null/") || path.includes("/undefined/")) {
-    throw new Error("Tidak ada OLT terpilih. Hubungi Multivers untuk assign OLT.");
+    throw new Error("Tidak ada OLT terpilih. Hubungi Super Admin untuk assign OLT.");
   }
   const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
   if (TOKEN) headers["Authorization"] = `Bearer ${TOKEN}`;
@@ -148,7 +148,7 @@ async function showApp() {
   document.getElementById("user-name").textContent = CURRENT_USER.username;
   document.getElementById("user-role").textContent = `${CURRENT_USER.role} · priv ${CURRENT_USER.privilege}`;
 
-  // Phase B: badge Multivers
+  // Phase B: badge Super Admin
   const mbadge = document.getElementById("multivers-badge");
   if (mbadge) {
     if (CURRENT_USER.is_super_admin) {
@@ -173,7 +173,7 @@ async function showApp() {
     const isMulti = CURRENT_USER.is_super_admin === 1;
     const msg = isMulti
       ? "Belum ada OLT terdaftar di sistem."
-      : "Belum ada OLT yang di-assign ke Anda. Hubungi Multivers untuk assign OLT.";
+      : "Belum ada OLT yang di-assign ke Anda. Hubungi Super Admin untuk assign OLT.";
     toast(msg, "warning");
     // Sembunyikan menu yang butuh OLT
     ["dashboard","pons","onus","optical","interfaces","vlans"].forEach(function(p) {
@@ -893,6 +893,13 @@ async function loadOLTs(opts = {}) {
   if (!el) return;
   el.innerHTML = '<div class="olt-empty"><i class="fas fa-spinner fa-spin"></i><p>Memuat OLT...</p></div>';
   try {
+    // Phase B3: cache daftar admin untuk badge owner
+    if (CURRENT_USER.is_super_admin) {
+      try {
+        const users = await api("/users");
+        window._oltOwnersCache = users;
+      } catch(_) { window._oltOwnersCache = []; }
+    }
     const olts = await api("/olts", opts);
     if (!olts.length) {
       el.innerHTML = '<div class="olt-empty">' +
@@ -930,6 +937,15 @@ function _renderOltCard(o) {
     actions += '<button class="btn-ghost" onclick="openOltEditModal(' + o.id + ')"><i class="fas fa-eye"></i> View</button>';
   }
 
+  // Phase B3: badge owner
+  let ownerLabel = "JSN Pusat";
+  let ownerClass = "multivers";
+  if (o.owner_user_id) {
+    const owner = (window._oltOwnersCache || []).find(x => x.id === o.owner_user_id);
+    ownerLabel = owner ? (owner.full_name || owner.username) : ("User #" + o.owner_user_id);
+    ownerClass = "";
+  }
+
   return '<div class="olt-card ' + (isDisabled ? 'olt-disabled' : '') + '">' +
     '<div class="olt-card-head">' +
       '<div class="olt-card-icon"><i class="fas fa-server"></i></div>' +
@@ -937,6 +953,7 @@ function _renderOltCard(o) {
       '<span class="olt-card-vendor">' + escapeHtml(vendor) + '</span>' +
       '<span class="olt-card-status ' + _oltStatusClass(o.status) + '"><span class="dot"></span>' + escapeHtml(o.status || "unknown") + '</span>' +
     '</div>' +
+    '<div style="margin-bottom:10px"><span class="olt-card-owner ' + ownerClass + '" title="Pemilik OLT"><i class="fas fa-user-shield"></i> ' + escapeHtml(ownerLabel) + '</span></div>' +
     '<div class="olt-card-body">' +
       '<div class="olt-row"><div class="olt-row-label">IP / Port</div><div class="olt-row-value"><code>' + escapeHtml(o.ip_address) + ':' + (o.port || 23) + '</code></div></div>' +
       '<div class="olt-row"><div class="olt-row-label">Model / FW</div><div class="olt-row-value">' + escapeHtml(o.model || "-") + ' / ' + escapeHtml(o.firmware || "-") + '</div></div>' +
@@ -986,7 +1003,22 @@ function _renderOltModal(info) {
 
   const pwPlaceholder = isEdit ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (kosongkan jika tidak diubah)" : "Masukkan Password Telnet";
 
+  // Phase B3: field Owner (khusus Super Admin)
+  const isMulti = CURRENT_USER.is_super_admin === 1;
+  let ownerField = "";
+  if (isMulti) {
+    const admins = (window._oltOwnersCache || []).filter(u => u.role === "admin" && !u.is_super_admin);
+    const ownerOpts = '<option value=""' + (!v.owner_user_id ? ' selected' : '') + '>JSN Pusat (Super Admin)</option>' +
+      admins.map(a => '<option value="' + a.id + '"' + (v.owner_user_id === a.id ? ' selected' : '') + '>' + escapeHtml(a.full_name || a.username) + ' (' + escapeHtml(a.username) + ')</option>').join("");
+    ownerField = '<div class="form-group" style="background:var(--violet-soft);border:1px solid var(--violet-ring);padding:12px;border-radius:8px;margin-bottom:16px">' +
+      '<label style="color:var(--violet)"><i class="fas fa-user-shield"></i> Pemilik OLT</label>' +
+      '<select id="olt-owner">' + ownerOpts + '</select>' +
+      '<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Kosongkan atau pilih JSN Pusat jika OLT ini milik pusat. Pilih admin jika OLT ini dikelola admin wilayah.</div>' +
+    '</div>';
+  }
+
   const bodyHTML =
+    ownerField +
     '<div class="form-group"><label>OLT Name</label><input id="olt-hostname" type="text" placeholder="Contoh: OLT-UTAMA-01" value="' + escapeHtml(v.hostname || "") + '"></div>' +
     '<div class="form-group"><label>IP Address</label><input id="olt-ip" type="text" placeholder="Contoh: 192.168.1.100" value="' + escapeHtml(v.ip_address || "") + '"></div>' +
     '<div class="form-group"><label>Type &amp; Hardware (Driver)</label><select id="olt-driver">' + driverOpts + '</select></div>' +
@@ -1101,6 +1133,15 @@ async function _submitOltForm(mode, oltId) {
     hardware_type: (document.getElementById("olt-hardware") || {}).value,
     location: ((document.getElementById("olt-location") || {}).value || "").trim() || null,
   };
+
+  // Phase B3: owner_user_id (khusus Super Admin)
+  if (CURRENT_USER.is_super_admin) {
+    const ownerEl = document.getElementById("olt-owner");
+    if (ownerEl) {
+      const ownerVal = ownerEl.value;
+      payload.owner_user_id = ownerVal ? parseInt(ownerVal, 10) : null;
+    }
+  }
 
   if (!payload.hostname || !payload.ip_address || !payload.username) {
     toast("Hostname, IP, dan Username wajib diisi", "error");
@@ -2803,6 +2844,27 @@ async function bulkDeleteAudit() {
 }
 
 // =================== USERS ===================
+// Phase B3: collapse/expand user tree
+function toggleUserTree(uid) {
+  const row = document.querySelector('[data-uid="' + uid + '"]');
+  if (!row) return;
+  const btn = row.querySelector('.user-tree-toggle i');
+  const isExpanded = btn.classList.contains('fa-chevron-down');
+
+  const allRows = document.querySelectorAll('.user-tree-row');
+  let targetDepth = parseInt(row.style.paddingLeft || '0', 10);
+  let i = Array.from(allRows).indexOf(row);
+  for (let j = i + 1; j < allRows.length; j++) {
+    const next = allRows[j];
+    const nextDepth = parseInt(next.style.paddingLeft || '0', 10);
+    if (nextDepth <= targetDepth) break;
+    next.classList.toggle('hidden', isExpanded);
+  }
+
+  btn.classList.toggle('fa-chevron-down', !isExpanded);
+  btn.classList.toggle('fa-chevron-right', isExpanded);
+}
+
 async function loadUsers(opts = {}) {
   const el = document.getElementById("user-table");
   try {
@@ -2818,44 +2880,74 @@ async function loadUsers(opts = {}) {
     el.innerHTML = banner + `
       <div class="table-wrap"><table class="table-premium">
         <thead><tr>
+          <th style="width:32px"></th>
           <th>Username</th><th>Nama Lengkap</th><th>Role</th><th>Owner</th>
           <th>Status</th><th>Last Login</th><th style="text-align:right">Aksi</th>
         </tr></thead>
         <tbody>
-          ${users.map(u => {
-            const isSelf = u.username === CURRENT_USER.username;
-            const statusBadge = u.is_active
-              ? '<span class="status-badge online">Aktif</span>'
-              : '<span class="status-badge offline">Nonaktif</span>';
-            let roleLabel = escapeHtml(u.role);
-            if (u.is_super_admin) roleLabel = '👑 Multivers';
-            let ownerLabel = "-";
-            if (u.owner_user_id) {
-              const owner = users.find(x => x.id === u.owner_user_id);
-              ownerLabel = owner ? escapeHtml(owner.username) : ("id=" + u.owner_user_id);
-            } else if (u.is_super_admin) {
-              ownerLabel = '<span style="color:var(--violet)">Semua OLT</span>';
-            }
-            return `<tr>
-              <td><b>${escapeHtml(u.username)}</b>${isSelf ? ' <span style="font-size:10px;color:var(--text-dim)">(Anda)</span>' : ''}</td>
-              <td>${escapeHtml(u.full_name || "-")}</td>
-              <td><span class="status-badge info" style="text-transform:capitalize">${roleLabel}</span></td>
-              <td style="font-size:12px">${ownerLabel}</td>
-              <td>${statusBadge}</td>
-              <td style="font-size:12px;color:var(--text-dim)">${u.last_login ? new Date(u.last_login).toLocaleString("id-ID", {day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}) : "Belum pernah"}</td>
-              <td style="text-align:right;white-space:nowrap">
-                <button class="btn-icon" onclick="openUserEdit(${u.id})" title="Edit user">
-                  <i class="fas fa-pen"></i>
-                </button>
-                <button class="btn-icon" onclick="openUserPasswordReset(${u.id})" title="Reset password">
-                  <i class="fas fa-key"></i>
-                </button>
-                ${!isSelf ? `<button class="btn-icon" onclick="deleteUser(${u.id})" title="Hapus user" style="color:var(--red)">
-                  <i class="fas fa-trash"></i>
-                </button>` : ""}
-              </td>
-            </tr>`;
-          }).join("")}
+          ${(() => {
+            const rows = [];
+            const subordinates = {};
+            const topLevel = [];
+
+            users.forEach(u => {
+              if (u.owner_user_id) {
+                (subordinates[u.owner_user_id] = subordinates[u.owner_user_id] || []).push(u);
+              } else {
+                topLevel.push(u);
+              }
+            });
+
+            const renderRow = (u, depth, hasChildren) => {
+              const isSelf = u.username === CURRENT_USER.username;
+              const statusBadge = u.is_active
+                ? '<span class="status-badge online">Aktif</span>'
+                : '<span class="status-badge offline">Nonaktif</span>';
+              let roleLabel = escapeHtml(u.role);
+              if (u.is_super_admin) roleLabel = '👑 Super Admin';
+              const indent = depth > 0 ? 'padding-left:' + (depth * 24) + 'px;' : '';
+              const arrow = hasChildren
+                ? '<button class="user-tree-toggle" onclick="toggleUserTree(' + u.id + ')"><i class="fas fa-chevron-down"></i></button>'
+                : '<span style="display:inline-block;width:20px"></span>';
+              const childCount = hasChildren ? '<span style="font-size:10px;color:var(--text-dim);margin-left:6px">(' + subordinates[u.id].length + ')</span>' : '';
+              let ownerLabel = "-";
+              if (u.owner_user_id) {
+                const ow = users.find(x => x.id === u.owner_user_id);
+                ownerLabel = ow ? escapeHtml(ow.username) : ("id=" + u.owner_user_id);
+              } else if (u.is_super_admin) {
+                ownerLabel = '<span style="color:var(--violet)">Semua OLT</span>';
+              }
+              return '<tr class="user-tree-row" data-uid="' + u.id + '" style="' + indent + '">' +
+                '<td style="text-align:center">' + arrow + '</td>' +
+                '<td><b>' + escapeHtml(u.username) + '</b>' + (isSelf ? ' <span style="font-size:10px;color:var(--text-dim)">(Anda)</span>' : '') + childCount + '</td>' +
+                '<td>' + escapeHtml(u.full_name || "-") + '</td>' +
+                '<td><span class="status-badge info" style="text-transform:capitalize">' + roleLabel + '</span></td>' +
+                '<td style="font-size:12px">' + ownerLabel + '</td>' +
+                '<td>' + statusBadge + '</td>' +
+                '<td style="font-size:12px;color:var(--text-dim)">' + (u.last_login ? new Date(u.last_login).toLocaleString("id-ID", {day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}) : "Belum pernah") + '</td>' +
+                '<td style="text-align:right;white-space:nowrap">' +
+                  '<button class="btn-icon" onclick="openUserEdit(' + u.id + ')" title="Edit user"><i class="fas fa-pen"></i></button>' +
+                  '<button class="btn-icon" onclick="openUserPasswordReset(' + u.id + ')" title="Reset password"><i class="fas fa-key"></i></button>' +
+                  (!isSelf ? '<button class="btn-icon" onclick="deleteUser(' + u.id + ')" title="Hapus user" style="color:var(--red)"><i class="fas fa-trash"></i></button>' : '') +
+                '</td>' +
+              '</tr>';
+            };
+
+            const renderTree = (u, depth) => {
+              const subs = subordinates[u.id] || [];
+              const hasChildren = subs.length > 0;
+              rows.push(renderRow(u, depth, hasChildren));
+              subs.forEach(c => renderTree(c, depth + 1));
+            };
+
+            topLevel.sort((a, b) => {
+              if (a.is_super_admin !== b.is_super_admin) return b.is_super_admin - a.is_super_admin;
+              return a.id - b.id;
+            });
+            topLevel.forEach(u => renderTree(u, 0));
+
+            return rows.join("");
+          })()}
         </tbody>
       </table></div>
     `;
@@ -2881,7 +2973,7 @@ async function openUserCreate() {
     owners.map(o => '<option value="' + o.id + '">' + escapeHtml(o.username) + ' (' + escapeHtml(o.full_name || "") + ')</option>').join("");
 
   const roleOptions = isMulti
-    ? '<option value="multivers">Multivers (lihat semua OLT)</option>' +
+    ? '<option value="multivers">Super Admin (akses semua OLT)</option>' +
       '<option value="admin">Admin (privilege 15) - kelola OLT sendiri</option>' +
       '<option value="operator">Operator (privilege 10) - provisioning, config</option>' +
       '<option value="field_tech">Field Tech (privilege 8) - reboot, lihat</option>' +
@@ -2947,17 +3039,17 @@ async function openUserEdit(userId) {
   const isMulti = CURRENT_USER.is_super_admin === 1;
   const targetIsMulti = u.is_super_admin === 1;
 
-  // Dropdown role — opsi "multivers" cuma untuk requester Multivers
+  // Dropdown role — opsi "multivers" cuma untuk requester Super Admin
   const roleOpts = [];
   if (isMulti) {
-    roleOpts.push('<option value="multivers" ' + (targetIsMulti ? 'selected' : '') + '>👑 Multivers (lihat semua OLT)</option>');
+    roleOpts.push('<option value="multivers" ' + (targetIsMulti ? 'selected' : '') + '>👑 Super Admin (lihat semua OLT)</option>');
   }
   roleOpts.push('<option value="admin" ' + (!targetIsMulti && u.role === "admin" ? 'selected' : '') + '>Admin (15)</option>');
   roleOpts.push('<option value="operator" ' + (!targetIsMulti && u.role === "operator" ? 'selected' : '') + '>Operator (10)</option>');
   roleOpts.push('<option value="field_tech" ' + (!targetIsMulti && u.role === "field_tech" ? 'selected' : '') + '>Field Tech (8)</option>');
   roleOpts.push('<option value="viewer" ' + (!targetIsMulti && u.role === "viewer" ? 'selected' : '') + '>Viewer (5)</option>');
 
-  // Owner dropdown (hanya untuk requester Multivers + target bukan Multivers)
+  // Owner dropdown (hanya untuk requester Super Admin + target bukan Super Admin)
   let ownerField = '';
   if (isMulti && !targetIsMulti) {
     const owners = allUsers.filter(x => x.role === "admin" && !x.is_super_admin && x.id !== u.id);
@@ -2995,7 +3087,7 @@ async function openUserEdit(userId) {
         payload.role = "admin";
         payload.is_super_admin = 1;
       } else if (targetIsMulti) {
-        // Downgrade dari Multivers: kirim is_super_admin=0
+        // Downgrade dari Super Admin: kirim is_super_admin=0
         payload.is_super_admin = 0;
       }
       if (ownerEl) {
