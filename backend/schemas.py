@@ -93,6 +93,8 @@ class OLTOut(BaseModel):
     driver: Optional[str] = None
     hardware_type: Optional[str] = None
     enabled: Optional[int] = 1
+    # Phase B3: ownership
+    owner_user_id: Optional[int] = None
 
     class Config:
         from_attributes = True
