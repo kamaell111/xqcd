@@ -82,3 +82,21 @@ def get_olt_or_403(db: Session, olt_id: int, ctx: OwnerContext) -> OLT:
             "Anda tidak punya akses ke OLT ini"
         )
     return olt
+
+
+def require_olt_access(
+    olt_id: int,
+    db: Session = Depends(get_db),
+    ctx: OwnerContext = Depends(get_owner_ctx),
+) -> OLT:
+    """FastAPI dependency: validasi akses ke OLT dari path param {olt_id}.
+
+    Return OLT kalau user punya akses (Multivers atau owner match).
+    Raise 404 kalau OLT tidak ada, 403 kalau bukan milik user.
+
+    Pemakaian:
+        @router.get("/{olt_id}/status")
+        def olt_status(olt: OLT = Depends(require_olt_access), ...):
+            # olt sudah divalidasi
+    """
+    return get_olt_or_403(db, olt_id, ctx)
