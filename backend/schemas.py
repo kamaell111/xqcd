@@ -72,6 +72,8 @@ class OLTCreate(BaseModel):
     snmp_community_ro: str = "public"
     snmp_community_rw: str = "private"
     location: Optional[str] = None
+    # Phase B3: hanya dihonor kalau requester Multivers
+    owner_user_id: Optional[int] = None
 
 
 class OLTOut(BaseModel):
@@ -113,6 +115,7 @@ class OLTUpdate(BaseModel):
     driver: Optional[str] = None
     hardware_type: Optional[str] = None
     enabled: Optional[int] = None
+    owner_user_id: Optional[int] = None
 
 
 class OLTTestRequest(BaseModel):

@@ -5,7 +5,7 @@ from database import get_db
 from models import OLT, User
 from schemas import OLTCreate, OLTOut, OLTUpdate, OLTTestRequest
 from auth import get_current_user, require_privilege, audit
-from tenancy import OwnerContext, get_owner_ctx, scoped_olts, get_olt_or_403
+from tenancy import OwnerContext, get_owner_ctx, scoped_olts, get_olt_or_403, require_olt_access
 from olt_manager import olt_manager
 from drivers import list_drivers, is_valid as is_driver_valid
 
@@ -22,11 +22,32 @@ def create_olt(req: OLTCreate, db: Session = Depends(get_db),
                user: User = Depends(require_privilege(10))):
     if db.query(OLT).filter(OLT.ip_address == req.ip_address).first():
         raise HTTPException(400, "OLT dengan IP tersebut sudah ada")
-    olt = OLT(**req.model_dump())
+
+    data = req.model_dump()
+
+    # Phase B3: mass-assignment protection
+    # - Multivers: boleh set owner_user_id eksplisit (validasi user ada)
+    # - Admin biasa: ABAIKAN owner_user_id dari body, auto-set ke self.id
+    if user.is_super_admin:
+        owner = data.get("owner_user_id")
+        if owner:
+            target = db.query(User).get(owner)
+            if not target:
+                raise HTTPException(400, f"Owner user id={owner} tidak ada")
+            if target.is_super_admin:
+                # OLT milik Multivers = owner_user_id NULL
+                data["owner_user_id"] = None
+            else:
+                data["owner_user_id"] = owner
+        # else: NULL (JSN pusat / Multivers)
+    else:
+        data["owner_user_id"] = user.id
+
+    olt = OLT(**data)
     db.add(olt)
     db.commit()
     db.refresh(olt)
-    audit(db, user.username, "create_olt", req.ip_address)
+    audit(db, user.username, "create_olt", f"{req.ip_address} owner={data.get('owner_user_id')}")
     return olt
 
 
@@ -75,17 +96,14 @@ def get_olt(olt_id: int, db: Session = Depends(get_db), ctx: OwnerContext = Depe
 
 
 @router.post("/{olt_id}/config/commit")
-def commit_config(olt_id: int, db: Session = Depends(get_db),
+def commit_config(db: Session = Depends(get_db),
+                  olt: OLT = Depends(require_olt_access),
                   user: User = Depends(require_privilege(15))):
     """Commit running-config ke flash (write). Dipakai untuk two-phase commit."""
     from olt_client import OLTClient
     from olt_manager import olt_manager
 
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
-    lock = olt_manager.get_thread_lock(str(olt_id))
+    lock = olt_manager.get_thread_lock(str(olt.id))
     if not lock.acquire(timeout=30):
         raise HTTPException(409, "OLT sedang sibuk — coba beberapa detik lagi")
     try:
@@ -97,11 +115,11 @@ def commit_config(olt_id: int, db: Session = Depends(get_db),
         try:
             out = client.commit_config()
         except Exception as e:
-            audit(db, user.username, "commit_config", str(olt_id), str(e), "failed")
+            audit(db, user.username, "commit_config", str(olt.id), str(e), "failed")
             raise HTTPException(500, f"Gagal commit: {e}")
 
-        olt_manager.mark_committed(str(olt_id))
-        audit(db, user.username, "commit_config", str(olt_id))
+        olt_manager.mark_committed(str(olt.id))
+        audit(db, user.username, "commit_config", str(olt.id))
         return {
             "ok": True,
             "output": out[:500] if out else "",
@@ -111,39 +129,48 @@ def commit_config(olt_id: int, db: Session = Depends(get_db),
 
 
 @router.get("/{olt_id}/config/pending")
-def get_config_pending(olt_id: int, db: Session = Depends(get_db),
+def get_config_pending(db: Session = Depends(get_db),
+                       olt: OLT = Depends(require_olt_access),
                        user: User = Depends(get_current_user)):
     """Status pending config (belum di-commit)."""
     from olt_manager import olt_manager
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    return olt_manager.get_pending_state(str(olt_id))
+    return olt_manager.get_pending_state(str(olt.id))
 
 
 @router.get("/{olt_id}/circuit")
-def get_circuit_state(olt_id: int, db: Session = Depends(get_db),
+def get_circuit_state(db: Session = Depends(get_db),
+                      olt: OLT = Depends(require_olt_access),
                       user: User = Depends(get_current_user)):
     """Status circuit breaker OLT — untuk indikator di UI."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    state = olt_manager.get_olt_circuit_state(str(olt_id))
-    state["olt_id"] = olt_id
+    state = olt_manager.get_olt_circuit_state(str(olt.id))
+    state["olt_id"] = olt.id
     state["ip_address"] = olt.ip_address
     return state
 
 
 @router.patch("/{olt_id}", response_model=OLTOut)
-def update_olt(olt_id: int, req: OLTUpdate,
+def update_olt(req: OLTUpdate,
                db: Session = Depends(get_db),
+               olt: OLT = Depends(require_olt_access),
                user: User = Depends(require_privilege(15))):
     """Update OLT. Field None = tidak diubah. Password kosong = tidak ubah."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
     data = req.model_dump(exclude_unset=True)
+
+    # Phase B3: mass-assignment protection owner_user_id
+    if "owner_user_id" in data:
+        if not user.is_super_admin:
+            # Admin biasa tidak boleh transfer kepemilikan
+            raise HTTPException(
+                403,
+                "Hanya Multivers yang bisa ubah kepemilikan OLT"
+            )
+        owner = data["owner_user_id"]
+        if owner is not None:
+            target = db.query(User).get(owner)
+            if not target:
+                raise HTTPException(400, f"Owner user id={owner} tidak ada")
+            if target.is_super_admin:
+                data["owner_user_id"] = None  # Multivers = NULL
 
     new_driver = data.get("driver", olt.driver)
     new_hw = data.get("hardware_type", olt.hardware_type)
@@ -153,7 +180,7 @@ def update_olt(olt_id: int, req: OLTUpdate,
     new_ip = data.get("ip_address", olt.ip_address)
     new_port = data.get("port", olt.port)
     dup = db.query(OLT).filter(
-        OLT.ip_address == new_ip, OLT.port == new_port, OLT.id != olt_id
+        OLT.ip_address == new_ip, OLT.port == new_port, OLT.id != olt.id
     ).first()
     if dup:
         raise HTTPException(400, f"OLT dengan {new_ip}:{new_port} sudah ada")
@@ -175,29 +202,27 @@ def update_olt(olt_id: int, req: OLTUpdate,
     if should_evict:
         from olt_client import evict_connection
         evicted = evict_connection(olt.ip_address, olt.port)
-        print(f"[OLT-UPDATE] id={olt_id} evicted {evicted} connection(s)")
+        print(f"[OLT-UPDATE] id={olt.id} evicted {evicted} connection(s)")
 
     safe_changes = {k: v for k, v in data.items()
                     if k not in ("password", "enable_password")}
-    audit(db, user.username, "update_olt", f"{olt_id} {safe_changes}")
+    audit(db, user.username, "update_olt", f"{olt.id} {safe_changes}")
     return olt
 
 
 @router.delete("/{olt_id}")
-def delete_olt(olt_id: int, db: Session = Depends(get_db),
+def delete_olt(db: Session = Depends(get_db),
+               olt: OLT = Depends(require_olt_access),
                user: User = Depends(require_privilege(15))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
     # Bersihkan cache koneksi Netmiko + state in-memory sebelum hapus
     from olt_client import evict_connection
     evicted = evict_connection(olt.ip_address, olt.port)
 
     # Fix #5: bersihkan lock/circuit/pending/jobs terminal dari olt_manager
-    cleared = olt_manager.clear_olt_state(olt_id)
+    cleared = olt_manager.clear_olt_state(olt.id)
 
+    oid = olt.id
     db.delete(olt)
     db.commit()
-    audit(db, user.username, "delete_olt", str(olt_id))
+    audit(db, user.username, "delete_olt", str(oid))
     return {"ok": True, "evicted_connections": evicted, "cleared_state": cleared}
