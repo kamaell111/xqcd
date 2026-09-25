@@ -100,3 +100,38 @@ def require_olt_access(
             # olt sudah divalidasi
     """
     return get_olt_or_403(db, olt_id, ctx)
+
+
+def scoped_alerts(db: Session, ctx: OwnerContext):
+    """Query Alert dengan scope ownership (join ke OLT)."""
+    from models import Alert
+    q = db.query(Alert)
+    if ctx.scope_owner_id is not None:
+        # Subquery: OLT ids milik scope
+        olt_subq = db.query(OLT.id).filter(OLT.owner_user_id == ctx.scope_owner_id).subquery()
+        q = q.filter(Alert.olt_id.in_(olt_subq))
+    return q
+
+
+def require_alert_access(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    ctx: OwnerContext = Depends(get_owner_ctx),
+):
+    """FastAPI dependency: validasi akses ke Alert by alert_id.
+
+    Validasi via alert.olt_id -> OLT.owner_user_id.
+    Return Alert atau raise 404/403.
+    """
+    from models import Alert
+    alert = db.query(Alert).get(alert_id)
+    if not alert:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert tidak ditemukan")
+    if ctx.scope_owner_id is not None:
+        olt = db.query(OLT).get(alert.olt_id)
+        if not olt or olt.owner_user_id != ctx.scope_owner_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Anda tidak punya akses ke alert ini"
+            )
+    return alert

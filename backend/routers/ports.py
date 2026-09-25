@@ -12,6 +12,7 @@ from schemas import PortToggleRequest, PortVLANEditRequest
 from auth import get_current_user, require_privilege, audit
 from olt_client import OLTClient
 from olt_manager import olt_manager
+from tenancy import require_olt_access
 from config import settings
 
 router = APIRouter(prefix="/api/v1/olts", tags=["ports"])
@@ -149,23 +150,20 @@ def _do_toggle_port(olt_id: int, req_dict: dict, db: Session, username: str,
 
 
 @router.post("/{olt_id}/ports/toggle")
-def toggle_port(olt_id: int, req: PortToggleRequest,
+def toggle_port(req: PortToggleRequest,
                 background_tasks: BackgroundTasks,
                 db: Session = Depends(get_db),
+                olt: OLT = Depends(require_olt_access),
                 user: User = Depends(require_privilege(10))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
     resource_key = f"toggle_port:{req.port_type}:{req.port_name}"
     job_id, is_new = olt_manager.create_job_atomic(
-        olt_id=str(olt_id), job_type="toggle_port", resource_key=resource_key,
+        olt_id=str(olt.id), job_type="toggle_port", resource_key=resource_key,
     )
     if not is_new:
         return {"job_id": job_id, "status": "queued", "duplicate": True}
 
     background_tasks.add_task(
-        _run_toggle_job, job_id=job_id, olt_id=olt_id,
+        _run_toggle_job, job_id=job_id, olt_id=olt.id,
         req_dict=req.model_dump() if hasattr(req, "model_dump") else req.dict(),
         username=user.username,
     )
@@ -272,23 +270,20 @@ def _do_edit_port_vlan(olt_id: int, req_dict: dict, db: Session, username: str,
 
 
 @router.post("/{olt_id}/ports/vlan")
-def edit_port_vlan(olt_id: int, req: PortVLANEditRequest,
+def edit_port_vlan(req: PortVLANEditRequest,
                    background_tasks: BackgroundTasks,
                    db: Session = Depends(get_db),
+                   olt: OLT = Depends(require_olt_access),
                    user: User = Depends(require_privilege(15))):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
     resource_key = f"edit_port:{req.port_name}"
     job_id, is_new = olt_manager.create_job_atomic(
-        olt_id=str(olt_id), job_type="edit_port_vlan", resource_key=resource_key,
+        olt_id=str(olt.id), job_type="edit_port_vlan", resource_key=resource_key,
     )
     if not is_new:
         return {"job_id": job_id, "status": "queued", "duplicate": True}
 
     background_tasks.add_task(
-        _run_edit_port_job, job_id=job_id, olt_id=olt_id,
+        _run_edit_port_job, job_id=job_id, olt_id=olt.id,
         req_dict=req.model_dump() if hasattr(req, "model_dump") else req.dict(),
         username=user.username,
     )

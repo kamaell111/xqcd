@@ -9,6 +9,7 @@ from models import OLT, User, MetricHistory
 from auth import get_current_user, audit
 from olt_client import OLTClient
 from olt_manager import olt_locked
+from tenancy import require_olt_access
 from olt_client import LAST_READ_SHORT, LAST_READ_LONG
 from alerting import check_olt_resource_alerts, check_onu_alerts
 
@@ -95,12 +96,9 @@ def _parse_system_group(output: str):
 
 @router.post("/{olt_id}/sync")
 @olt_locked
-def sync_olt(olt_id: int, db: Session = Depends(get_db),
+def sync_olt(db: Session = Depends(get_db),
+             olt: OLT = Depends(require_olt_access),
              user: User = Depends(get_current_user)):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-
     client = _make_client(olt)
     try:
         conn = client._connect()
@@ -112,7 +110,7 @@ def sync_olt(olt_id: int, db: Session = Depends(get_db),
     except Exception as e:
         olt.status = "offline"
         db.commit()
-        audit(db, user.username, "sync_olt", str(olt_id), str(e), "failed")
+        audit(db, user.username, "sync_olt", str(olt.id), str(e), "failed")
         raise HTTPException(500, f"Gagal sync: {e}")
 
     proc = _parse_processor(proc_out)
@@ -442,8 +440,7 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
     """Core sync PON + ONU — dipakai endpoint DAN scheduler.
     Raise Exception kalau gagal. Caller yang handle commit + audit."""
     from models import PONPort, ONU
-    from olt_manager import olt_manager   # fix: import untuk cek active job
-
+    from olt_manager import olt_manager
     olt_id = olt.id
     client = _make_client(olt)
     optical_map = {}    # {onu_index: {"rx": ..., "tx": ...}}
@@ -736,18 +733,16 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
 
 @router.post("/{olt_id}/sync-pons")
 @olt_locked
-def sync_pons(olt_id: int, db: Session = Depends(get_db),
+def sync_pons(db: Session = Depends(get_db),
+              olt: OLT = Depends(require_olt_access),
               user: User = Depends(get_current_user)):
     """Sync status 16 PON port + list ONU dari OLT (endpoint manual)."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
     try:
         result = _do_sync_pons(db, olt)
-        audit(db, user.username, "sync_pons", str(olt_id))
+        audit(db, user.username, "sync_pons", str(olt.id))
         return result
     except HTTPException:
         raise
     except Exception as e:
-        audit(db, user.username, "sync_pons", str(olt_id), str(e), "failed")
+        audit(db, user.username, "sync_pons", str(olt.id), str(e), "failed")
         raise HTTPException(500, f"Gagal sync PON: {e}")

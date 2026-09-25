@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from database import get_db
 from models import Alert, User
 from auth import get_current_user, require_privilege, audit
+from tenancy import OwnerContext, get_owner_ctx, scoped_alerts, require_alert_access
 
 router = APIRouter(prefix="/api/v1/alerts", tags=["alerts"])
 
@@ -32,8 +33,9 @@ def _serialize_alert(a: Alert) -> dict:
 def list_alerts(severity: Optional[str] = None, resolved: Optional[bool] = None,
                 olt_id: Optional[int] = None, limit: int = 100,
                 db: Session = Depends(get_db),
+                ctx: OwnerContext = Depends(get_owner_ctx),
                 user: User = Depends(get_current_user)):
-    q = db.query(Alert)
+    q = scoped_alerts(db, ctx)
     if severity:
         q = q.filter(Alert.severity == severity)
     if resolved is not None:
@@ -54,11 +56,10 @@ def get_recent_recoveries(since: float = 0,
 
 
 @router.post("/{alert_id}/ack")
-def ack_alert(alert_id: int, db: Session = Depends(get_db),
+def ack_alert(alert: Alert = Depends(require_alert_access),
+              db: Session = Depends(get_db),
               user: User = Depends(get_current_user)):
-    a = db.query(Alert).get(alert_id)
-    if not a:
-        raise HTTPException(404, "Alert tidak ditemukan")
+    a = alert
     a.acknowledged = True
     a.ack_by = user.username
     a.ack_at = datetime.now(timezone.utc)
@@ -68,11 +69,10 @@ def ack_alert(alert_id: int, db: Session = Depends(get_db),
 
 
 @router.post("/{alert_id}/resolve")
-def resolve_alert(alert_id: int, db: Session = Depends(get_db),
+def resolve_alert(alert: Alert = Depends(require_alert_access),
+                  db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
-    a = db.query(Alert).get(alert_id)
-    if not a:
-        raise HTTPException(404, "Alert tidak ditemukan")
+    a = alert
     a.resolved = True
     a.resolved_at = datetime.now(timezone.utc)
     db.commit()
@@ -81,12 +81,11 @@ def resolve_alert(alert_id: int, db: Session = Depends(get_db),
 
 
 @router.delete("/{alert_id}")
-def delete_alert(alert_id: int, db: Session = Depends(get_db),
+def delete_alert(alert: Alert = Depends(require_alert_access),
+                 db: Session = Depends(get_db),
                  user: User = Depends(require_privilege(10))):
     """Hapus 1 alert."""
-    a = db.query(Alert).get(alert_id)
-    if not a:
-        raise HTTPException(404, "Alert tidak ditemukan")
+    a = alert
     db.delete(a)
     db.commit()
     audit(db, user.username, "delete_alert", str(alert_id))
@@ -95,13 +94,14 @@ def delete_alert(alert_id: int, db: Session = Depends(get_db),
 
 @router.post("/bulk-delete")
 def bulk_delete_alerts(ids: List[int], db: Session = Depends(get_db),
+                       ctx: OwnerContext = Depends(get_owner_ctx),
                        user: User = Depends(require_privilege(10))):
     """Hapus beberapa alert sekaligus berdasarkan list ID."""
     if not ids:
         return {"ok": True, "deleted": 0}
-    count = db.query(Alert).filter(Alert.id.in_(ids)).delete(
-        synchronize_session=False
-    )
+    # Scope: hanya hapus alert dalam scope user
+    q = scoped_alerts(db, ctx).filter(Alert.id.in_(ids))
+    count = q.delete(synchronize_session=False)
     db.commit()
     audit(db, user.username, "bulk_delete_alerts", f"count={count}")
     return {"ok": True, "deleted": count}
@@ -110,11 +110,12 @@ def bulk_delete_alerts(ids: List[int], db: Session = Depends(get_db),
 @router.delete("")
 def delete_all_alerts(only_resolved: bool = Query(False),
                       db: Session = Depends(get_db),
+                      ctx: OwnerContext = Depends(get_owner_ctx),
                       user: User = Depends(require_privilege(15))):
-    """Hapus semua alert.
+    """Hapus semua alert (dalam scope user).
     - only_resolved=false (default): hapus semua
     - only_resolved=true: hapus cuma yang sudah resolved"""
-    q = db.query(Alert)
+    q = scoped_alerts(db, ctx)
     if only_resolved:
         q = q.filter(Alert.resolved == True)
     count = q.count()
