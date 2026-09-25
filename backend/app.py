@@ -72,6 +72,10 @@ def migrate_db():
             "ALTER TABLE users ADD COLUMN full_name TEXT",
             "ALTER TABLE users ADD COLUMN updated_at DATETIME",
             "ALTER TABLE onus ADD COLUMN last_dying_gasp DATETIME",
+            # 1a-1: multi-vendor prep di OLT
+            "ALTER TABLE olts ADD COLUMN driver TEXT DEFAULT 'zte_zxan'",
+            "ALTER TABLE olts ADD COLUMN hardware_type TEXT DEFAULT 'zte-c320'",
+            "ALTER TABLE olts ADD COLUMN enabled INTEGER DEFAULT 1",
         ]:
             try:
                 db.execute(text(col_sql))

@@ -3,9 +3,10 @@ from sqlalchemy.orm import Session
 from typing import List
 from database import get_db
 from models import OLT, User
-from schemas import OLTCreate, OLTOut
+from schemas import OLTCreate, OLTOut, OLTUpdate, OLTTestRequest
 from auth import get_current_user, require_privilege, audit
 from olt_manager import olt_manager
+from drivers import list_drivers, is_valid as is_driver_valid
 
 router = APIRouter(prefix="/api/v1/olts", tags=["olts"])
 
@@ -26,6 +27,44 @@ def create_olt(req: OLTCreate, db: Session = Depends(get_db),
     db.refresh(olt)
     audit(db, user.username, "create_olt", req.ip_address)
     return olt
+
+
+# =================== MULTI-VENDOR (1a-1) ===================
+# Route statis harus di atas /{olt_id} biar FastAPI tidak parse "drivers" sebagai int.
+
+@router.get("/drivers")
+def get_drivers(user: User = Depends(get_current_user)):
+    """Daftar driver + hardware types untuk UI dropdown."""
+    return list_drivers()
+
+
+@router.post("/test-connection")
+def test_olt_connection(req: OLTTestRequest,
+                        user: User = Depends(require_privilege(15))):
+    """Tes koneksi Telnet ke OLT tanpa simpan ke DB."""
+    from olt_client import OLTClient
+    import re
+    try:
+        client = OLTClient(
+            host=req.ip_address,
+            username=req.username,
+            password=req.password,
+            enable_password=req.enable_password or "",
+            port=req.port,
+            protocol=req.protocol or "telnet",
+        )
+        result = client.test_connection()
+        if result.get("ok") and result.get("output"):
+            out = result["output"]
+            m = re.search(r"System name:\s*(\S+)", out) or re.search(r"^\s*hostname\s+(\S+)", out, re.MULTILINE)
+            result["hostname"] = m.group(1) if m else ""
+            m = re.search(r"(ZXA10\s+)?C\d{3}", out)
+            result["model"] = m.group(0).strip() if m else ""
+            m = re.search(r"V\d+\.\d+\.\d+", out)
+            result["firmware"] = m.group(0) if m else ""
+        return result
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @router.get("/{olt_id}", response_model=OLTOut)
@@ -94,6 +133,55 @@ def get_circuit_state(olt_id: int, db: Session = Depends(get_db),
     state["olt_id"] = olt_id
     state["ip_address"] = olt.ip_address
     return state
+
+
+@router.patch("/{olt_id}", response_model=OLTOut)
+def update_olt(olt_id: int, req: OLTUpdate,
+               db: Session = Depends(get_db),
+               user: User = Depends(require_privilege(15))):
+    """Update OLT. Field None = tidak diubah. Password kosong = tidak ubah."""
+    olt = db.query(OLT).get(olt_id)
+    if not olt:
+        raise HTTPException(404, "OLT tidak ditemukan")
+
+    data = req.model_dump(exclude_unset=True)
+
+    new_driver = data.get("driver", olt.driver)
+    new_hw = data.get("hardware_type", olt.hardware_type)
+    if not is_driver_valid(new_driver, new_hw):
+        raise HTTPException(400, f"Driver/hardware tidak valid: {new_driver}/{new_hw}")
+
+    new_ip = data.get("ip_address", olt.ip_address)
+    new_port = data.get("port", olt.port)
+    dup = db.query(OLT).filter(
+        OLT.ip_address == new_ip, OLT.port == new_port, OLT.id != olt_id
+    ).first()
+    if dup:
+        raise HTTPException(400, f"OLT dengan {new_ip}:{new_port} sudah ada")
+
+    if "password" in data and data["password"] == "":
+        data.pop("password")
+    if "enable_password" in data and data["enable_password"] == "":
+        data.pop("enable_password")
+
+    cred_keys = {"ip_address", "port", "username", "password", "enable_password", "protocol"}
+    should_evict = bool(cred_keys & set(data.keys()))
+
+    for k, v in data.items():
+        setattr(olt, k, v)
+
+    db.commit()
+    db.refresh(olt)
+
+    if should_evict:
+        from olt_client import evict_connection
+        evicted = evict_connection(olt.ip_address, olt.port)
+        print(f"[OLT-UPDATE] id={olt_id} evicted {evicted} connection(s)")
+
+    safe_changes = {k: v for k, v in data.items()
+                    if k not in ("password", "enable_password")}
+    audit(db, user.username, "update_olt", f"{olt_id} {safe_changes}")
+    return olt
 
 
 @router.delete("/{olt_id}")

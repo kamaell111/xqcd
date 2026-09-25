@@ -41,6 +41,10 @@ class OLT(Base):
     snmp_port = Column(Integer, default=161)
     model = Column(String(32), default="C320")
     firmware = Column(String(32), default="V4.8.35")
+    # 1a-1: multi-vendor prep
+    driver = Column(String(32), default="zte_zxan")            # key driver registry
+    hardware_type = Column(String(32), default="zte-c320")     # key hardware di driver
+    enabled = Column(Integer, default=1)                        # 1=aktif, 0=disable polling
     location = Column(String(255), nullable=True)
     status = Column(String(16), default="unknown")
     cpu_usage = Column(Float, nullable=True)

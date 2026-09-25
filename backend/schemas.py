@@ -78,9 +78,42 @@ class OLTOut(BaseModel):
     temperature: Optional[float] = None
     location: Optional[str] = None
     last_polled: Optional[datetime] = None
+    # 1a-1 multi-vendor
+    driver: Optional[str] = None
+    hardware_type: Optional[str] = None
+    enabled: Optional[int] = 1
 
     class Config:
         from_attributes = True
+
+
+class OLTUpdate(BaseModel):
+    """Update OLT. Semua field opsional. Password kosong = tidak diubah."""
+    hostname: Optional[str] = None
+    ip_address: Optional[str] = None
+    protocol: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    enable_password: Optional[str] = None
+    snmp_version: Optional[str] = None
+    snmp_community_ro: Optional[str] = None
+    snmp_community_rw: Optional[str] = None
+    snmp_port: Optional[int] = None
+    location: Optional[str] = None
+    driver: Optional[str] = None
+    hardware_type: Optional[str] = None
+    enabled: Optional[int] = None
+
+
+class OLTTestRequest(BaseModel):
+    """Body untuk POST /olts/test-connection (tanpa simpan DB)."""
+    ip_address: str
+    port: int = 23
+    username: str
+    password: str
+    enable_password: Optional[str] = None
+    protocol: str = "telnet"
 
 
 class PONPortOut(BaseModel):
