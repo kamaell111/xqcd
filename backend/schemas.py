@@ -19,6 +19,9 @@ class UserCreate(BaseModel):
     password: str
     full_name: Optional[str] = None
     role: str = "viewer"
+    # Phase B2g: ownership (hanya dihonor kalau requester Multivers)
+    owner_user_id: Optional[int] = None
+    is_super_admin: int = 0
 
 
 class UserOut(BaseModel):
@@ -28,6 +31,9 @@ class UserOut(BaseModel):
     privilege: int
     role: str
     is_active: bool
+    # Phase B2g
+    is_super_admin: int = 0
+    owner_user_id: Optional[int] = None
     last_login: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -40,6 +46,9 @@ class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     role: Optional[str] = None
     is_active: Optional[bool] = None
+    # Phase B2g (hanya dihonor kalau requester Multivers)
+    owner_user_id: Optional[int] = None
+    is_super_admin: Optional[int] = None
 
 
 class PasswordReset(BaseModel):

@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from typing import List
 from datetime import datetime
 from database import get_db
@@ -37,11 +38,62 @@ def _count_active_admins(db: Session, exclude_id: int = None) -> int:
     return q.count()
 
 
+# =================== PHASE B2g: OWNERSHIP HELPERS ===================
+def _is_multivers(u: User) -> bool:
+    return bool(u.is_super_admin)
+
+
+def _can_manage(target: User, actor: User) -> bool:
+    """Cek apakah actor boleh manage target user.
+
+    Rule:
+    - Multivers: boleh manage semua
+    - Admin biasa: hanya bawahan (owner_user_id == actor.id), dan target
+      bukan admin/multivers
+    - Selain admin/multivers: tidak boleh (require_privilege(15) sudah blok)
+    """
+    if _is_multivers(actor):
+        return True
+    if target.id == actor.id:
+        return True  # boleh manage diri sendiri (edit nama/dll via endpoint ini)
+    if target.is_super_admin:
+        return False
+    if target.role == "admin":
+        return False
+    return target.owner_user_id == actor.id
+
+
+def _count_active_managers(db: Session, exclude_id: int = None) -> int:
+    """Hitung admin + multivers aktif. Untuk guard 'terakhir'."""
+    q = db.query(User).filter(
+        User.is_active == True,
+        or_(User.role == "admin", User.is_super_admin == 1),
+    )
+    if exclude_id:
+        q = q.filter(User.id != exclude_id)
+    return q.count()
+
+
+def _count_active_super(db: Session, exclude_id: int = None) -> int:
+    """Hitung Multivers aktif."""
+    q = db.query(User).filter(
+        User.is_active == True,
+        User.is_super_admin == 1,
+    )
+    if exclude_id:
+        q = q.filter(User.id != exclude_id)
+    return q.count()
+
+
 # =================== LIST ===================
 @router.get("/users", response_model=List[UserOut])
 def list_users(db: Session = Depends(get_db),
                user: User = Depends(require_privilege(15))):
-    return db.query(User).all()
+    q = db.query(User)
+    if not _is_multivers(user):
+        # Admin biasa: cuma diri sendiri + bawahan
+        q = q.filter(or_(User.id == user.id, User.owner_user_id == user.id))
+    return q.order_by(User.id).all()
 
 
 # =================== CREATE ===================
@@ -51,17 +103,38 @@ def create_user(req: UserCreate, db: Session = Depends(get_db),
     if db.query(User).filter(User.username == req.username).first():
         raise HTTPException(400, "Username sudah ada")
 
-    # ⭐ Role menentukan privilege (bukan input manual)
     role = req.role or "viewer"
-    priv = _role_to_privilege(role)
 
-    u = User(
-        username=req.username,
-        password_hash=hash_password(req.password),
-        full_name=req.full_name if hasattr(req, "full_name") else None,
-        privilege=priv,
-        role=role,
-    )
+    if _is_multivers(user):
+        # Multivers: bisa set role apa saja + owner eksplisit
+        priv = _role_to_privilege(role)
+        u = User(
+            username=req.username,
+            password_hash=hash_password(req.password),
+            full_name=req.full_name,
+            privilege=priv,
+            role=role,
+            is_super_admin=req.is_super_admin or 0,
+            owner_user_id=req.owner_user_id,
+        )
+    else:
+        # Admin biasa: hanya bisa create operator/field_tech/viewer
+        if role not in ("operator", "field_tech", "viewer"):
+            raise HTTPException(
+                403,
+                f"Admin tidak bisa membuat user dengan role '{role}'. "
+                f"Hanya: operator, field_tech, viewer."
+            )
+        priv = _role_to_privilege(role)
+        u = User(
+            username=req.username,
+            password_hash=hash_password(req.password),
+            full_name=req.full_name,
+            privilege=priv,
+            role=role,
+            is_super_admin=0,
+            owner_user_id=user.id,  # auto-assign ke admin pembuat
+        )
     db.add(u)
     db.commit()
     db.refresh(u)
@@ -78,6 +151,10 @@ def update_user(user_id: int, req: UserUpdate,
     if not u:
         raise HTTPException(404, "User tidak ditemukan")
 
+    # Phase B2g: cek hak akses
+    if not _can_manage(u, user):
+        raise HTTPException(403, "Anda tidak punya akses ke user ini")
+
     changed = []
     bump = False
 
@@ -86,11 +163,37 @@ def update_user(user_id: int, req: UserUpdate,
         u.full_name = req.full_name
         changed.append(f"full_name={req.full_name}")
 
+    # Phase B2g: is_super_admin (hanya Multivers yang boleh ubah)
+    if req.is_super_admin is not None and req.is_super_admin != u.is_super_admin:
+        if not _is_multivers(user):
+            raise HTTPException(403, "Hanya Multivers yang bisa ubah status Multivers")
+        # Guard: jangan sampai 0 Multivers
+        if u.is_super_admin == 1 and req.is_super_admin == 0:
+            if _count_active_super(db, exclude_id=user_id) == 0:
+                raise HTTPException(400, "Tidak bisa demote Multivers terakhir")
+        u.is_super_admin = req.is_super_admin
+        changed.append(f"is_super_admin={req.is_super_admin}")
+        bump = True
+
+    # Phase B2g: owner_user_id (hanya Multivers yang boleh ubah eksplisit)
+    if req.owner_user_id is not None and req.owner_user_id != u.owner_user_id:
+        if not _is_multivers(user):
+            raise HTTPException(403, "Hanya Multivers yang bisa ubah owner user")
+        # Validasi owner target ada
+        if req.owner_user_id and not db.query(User).get(req.owner_user_id):
+            raise HTTPException(400, f"Owner user id={req.owner_user_id} tidak ada")
+        u.owner_user_id = req.owner_user_id
+        changed.append(f"owner_user_id={req.owner_user_id}")
+
     # Update role (mengubah privilege + invalidate token)
     if req.role is not None and req.role != u.role:
+        # Admin biasa tidak boleh promote/demote ke admin
+        if not _is_multivers(user):
+            if req.role == "admin" or u.role == "admin":
+                raise HTTPException(403, "Hanya Multivers yang bisa ubah role admin")
         new_priv = _role_to_privilege(req.role)
         old_role = u.role
-        # ⭐ Guard: kalau turun dari admin dan tinggal 1 admin → tolak
+        # Guard: kalau turun dari admin dan tinggal 1 admin → tolak
         if old_role == "admin" and new_priv < 15:
             if _count_active_admins(db, exclude_id=user_id) == 0:
                 raise HTTPException(400, "Tidak bisa menurunkan role admin terakhir")
@@ -133,6 +236,8 @@ def admin_reset_password(user_id: int, req: PasswordReset,
     u = db.query(User).get(user_id)
     if not u:
         raise HTTPException(404, "User tidak ditemukan")
+    if not _can_manage(u, user):
+        raise HTTPException(403, "Anda tidak punya akses ke user ini")
     if not req.new_password or len(req.new_password) < 6:
         raise HTTPException(400, "Password minimal 6 karakter")
 
@@ -170,13 +275,39 @@ def delete_user(user_id: int, db: Session = Depends(get_db),
     if not u:
         raise HTTPException(404, "User tidak ditemukan")
 
-    # ⭐ Guard: admin terakhir
+    # Phase B2g: cek hak akses
+    if not _can_manage(u, user):
+        raise HTTPException(403, "Anda tidak punya akses ke user ini")
+
+    # Guard: admin terakhir
     if u.role == "admin" and _count_active_admins(db, exclude_id=user_id) == 0:
         raise HTTPException(400, "Tidak bisa hapus admin terakhir")
 
-    # ⭐ Guard: tidak bisa hapus diri sendiri
+    # Phase B2g: guard Multivers terakhir
+    if u.is_super_admin == 1 and _count_active_super(db, exclude_id=user_id) == 0:
+        raise HTTPException(400, "Tidak bisa hapus Multivers terakhir")
+
+    # Guard: tidak bisa hapus diri sendiri
     if u.id == user.id:
         raise HTTPException(400, "Tidak bisa hapus akun sendiri")
+
+    # Phase B2g: tolak hapus user kalau masih punya bawahan (owner_user_id nunjuk ke dia)
+    if u.role == "admin":
+        bawahan = db.query(User).filter(User.owner_user_id == user_id).count()
+        if bawahan > 0:
+            raise HTTPException(
+                400,
+                f"Admin ini masih punya {bawahan} bawahan. Transfer/pindah dulu."
+            )
+
+    # Phase B2g: tolak hapus admin kalau masih punya OLT
+    from models import OLT
+    olt_count = db.query(OLT).filter(OLT.owner_user_id == user_id).count()
+    if olt_count > 0:
+        raise HTTPException(
+            400,
+            f"User ini masih owner {olt_count} OLT. Transfer OLT dulu sebelum hapus."
+        )
 
     username = u.username
     db.delete(u)
