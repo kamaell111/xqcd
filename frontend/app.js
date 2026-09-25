@@ -15,6 +15,10 @@ let _inventoryCache = null;   // cache inventory (VLAN, T-CONT, ONU type)
 
 // =================== HTTP ===================
 async function api(path, opts = {}) {
+  // Phase B: guard kalau CURRENT_OLT_ID null
+  if (path.includes("/null/") || path.includes("/undefined/")) {
+    throw new Error("Tidak ada OLT terpilih. Hubungi Multivers untuk assign OLT.");
+  }
   const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
   if (TOKEN) headers["Authorization"] = `Bearer ${TOKEN}`;
   const res = await fetch(`${API}${path}`, { ...opts, headers, signal: opts.signal });
@@ -84,8 +88,12 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
       body: JSON.stringify({ username: u, password: p }),
     });
     TOKEN = res.access_token;
-    CURRENT_USER = res.user;
     localStorage.setItem("token", TOKEN);
+
+    // Phase B: fetch /auth/me untuk data lengkap (is_super_admin, owner_user_id)
+    let me = {};
+    try { me = await api("/auth/me"); } catch(_) {}
+    CURRENT_USER = { ...res.user, ...me };
     localStorage.setItem("user", JSON.stringify(CURRENT_USER));
     await showApp();
   } catch (ex) {
@@ -140,6 +148,16 @@ async function showApp() {
   document.getElementById("user-name").textContent = CURRENT_USER.username;
   document.getElementById("user-role").textContent = `${CURRENT_USER.role} · priv ${CURRENT_USER.privilege}`;
 
+  // Phase B: badge Multivers
+  const mbadge = document.getElementById("multivers-badge");
+  if (mbadge) {
+    if (CURRENT_USER.is_super_admin) {
+      mbadge.classList.remove("hidden");
+    } else {
+      mbadge.classList.add("hidden");
+    }
+  }
+
   if (CURRENT_USER.privilege < 15) {
     const u = document.querySelector('[data-page="users"]');
     if (u) u.style.display = "none";
@@ -152,8 +170,18 @@ async function showApp() {
   await initCurrentOltId();
 
   if (CURRENT_OLT_ID == null) {
-    toast("Tidak ada OLT terdaftar. Tambahkan OLT di menu OLT Management.", "warning");
-    loadPage("olts");
+    const isMulti = CURRENT_USER.is_super_admin === 1;
+    const msg = isMulti
+      ? "Belum ada OLT terdaftar di sistem."
+      : "Belum ada OLT yang di-assign ke Anda. Hubungi Multivers untuk assign OLT.";
+    toast(msg, "warning");
+    // Sembunyikan menu yang butuh OLT
+    ["dashboard","pons","onus","optical","interfaces","vlans"].forEach(function(p) {
+      const el = document.querySelector('[data-page="' + p + '"]');
+      if (el) el.style.opacity = "0.35", el.style.pointerEvents = "none";
+    });
+    // Arahkan ke halaman OLT / Users
+    loadPage(isMulti ? "olts" : "users");
     return;
   }
 
@@ -2790,7 +2818,7 @@ async function loadUsers(opts = {}) {
     el.innerHTML = banner + `
       <div class="table-wrap"><table class="table-premium">
         <thead><tr>
-          <th>Username</th><th>Nama Lengkap</th><th>Role</th><th>Privilege</th>
+          <th>Username</th><th>Nama Lengkap</th><th>Role</th><th>Owner</th>
           <th>Status</th><th>Last Login</th><th style="text-align:right">Aksi</th>
         </tr></thead>
         <tbody>
@@ -2799,11 +2827,20 @@ async function loadUsers(opts = {}) {
             const statusBadge = u.is_active
               ? '<span class="status-badge online">Aktif</span>'
               : '<span class="status-badge offline">Nonaktif</span>';
+            let roleLabel = escapeHtml(u.role);
+            if (u.is_super_admin) roleLabel = '👑 Multivers';
+            let ownerLabel = "-";
+            if (u.owner_user_id) {
+              const owner = users.find(x => x.id === u.owner_user_id);
+              ownerLabel = owner ? escapeHtml(owner.username) : ("id=" + u.owner_user_id);
+            } else if (u.is_super_admin) {
+              ownerLabel = '<span style="color:var(--violet)">Semua OLT</span>';
+            }
             return `<tr>
               <td><b>${escapeHtml(u.username)}</b>${isSelf ? ' <span style="font-size:10px;color:var(--text-dim)">(Anda)</span>' : ''}</td>
               <td>${escapeHtml(u.full_name || "-")}</td>
-              <td><span class="status-badge info" style="text-transform:capitalize">${escapeHtml(u.role)}</span></td>
-              <td>${u.privilege}</td>
+              <td><span class="status-badge info" style="text-transform:capitalize">${roleLabel}</span></td>
+              <td style="font-size:12px">${ownerLabel}</td>
               <td>${statusBadge}</td>
               <td style="font-size:12px;color:var(--text-dim)">${u.last_login ? new Date(u.last_login).toLocaleString("id-ID", {day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}) : "Belum pernah"}</td>
               <td style="text-align:right;white-space:nowrap">
@@ -2829,32 +2866,66 @@ async function loadUsers(opts = {}) {
 
 
 // =================== MODAL TAMBAH USER ===================
-function openUserCreate() {
-  openModal("Tambah User Baru", `
-    <div class="form-group"><label>Username</label><input id="u-username" placeholder="budi"></div>
-    <div class="form-group"><label>Nama Lengkap</label><input id="u-fullname" placeholder="Budi Santoso"></div>
-    <div class="form-group"><label>Password</label><input type="password" id="u-password" placeholder="Minimal 6 karakter"></div>
-    <div class="form-group"><label>Role</label>
-      <select id="u-role">
-        <option value="admin">Admin (privilege 15) — akses penuh</option>
-        <option value="operator">Operator (privilege 10) — provisioning, config</option>
-        <option value="field_tech">Field Tech (privilege 8) — reboot, lihat</option>
-        <option value="viewer" selected>Viewer (privilege 5) — hanya lihat</option>
-      </select>
-      <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Role menentukan hak akses. Privilege di-set otomatis.</div>
-    </div>
-  `, [
+async function openUserCreate() {
+  const isMulti = CURRENT_USER.is_super_admin === 1;
+
+  let owners = [];
+  if (isMulti) {
+    try {
+      const all = await api("/users");
+      owners = all.filter(u => u.role === "admin" && !u.is_super_admin);
+    } catch(_) {}
+  }
+
+  const ownerOptions = '<option value="">— Tidak ada (langsung di bawah saya) —</option>' +
+    owners.map(o => '<option value="' + o.id + '">' + escapeHtml(o.username) + ' (' + escapeHtml(o.full_name || "") + ')</option>').join("");
+
+  const roleOptions = isMulti
+    ? '<option value="multivers">Multivers (lihat semua OLT)</option>' +
+      '<option value="admin">Admin (privilege 15) - kelola OLT sendiri</option>' +
+      '<option value="operator">Operator (privilege 10) - provisioning, config</option>' +
+      '<option value="field_tech">Field Tech (privilege 8) - reboot, lihat</option>' +
+      '<option value="viewer" selected>Viewer (privilege 5) - hanya lihat</option>'
+    : '<option value="operator">Operator (privilege 10) - provisioning, config</option>' +
+      '<option value="field_tech">Field Tech (privilege 8) - reboot, lihat</option>' +
+      '<option value="viewer" selected>Viewer (privilege 5) - hanya lihat</option>';
+
+  const ownerField = isMulti
+    ? '<div class="form-group"><label>Atasan / Owner (opsional)</label>' +
+      '<select id="u-owner">' + ownerOptions + '</select>' +
+      '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Pilih admin sebagai atasan. Operator/viewer akan share akses OLT dengan admin ini.</div></div>'
+    : '<div style="background:var(--surface-2);padding:10px 14px;border-radius:8px;font-size:11px;color:var(--text-dim);margin-top:10px">' +
+      '<i class="fas fa-info-circle"></i> User baru otomatis jadi bawahan Anda.</div>';
+
+  openModal("Tambah User Baru",
+    '<div class="form-group"><label>Username</label><input id="u-username" placeholder="budi"></div>' +
+    '<div class="form-group"><label>Nama Lengkap</label><input id="u-fullname" placeholder="Budi Santoso"></div>' +
+    '<div class="form-group"><label>Password</label><input type="password" id="u-password" placeholder="Minimal 6 karakter"></div>' +
+    '<div class="form-group"><label>Role</label><select id="u-role">' + roleOptions + '</select>' +
+    '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Role menentukan hak akses. Privilege di-set otomatis.</div></div>' +
+    ownerField
+  , [
     { label: "Kembali", cls: "btn-secondary", action: closeModal },
     { label: "Simpan", cls: "btn-primary", action: async () => {
       const username = document.getElementById("u-username").value.trim();
       const full_name = document.getElementById("u-fullname").value.trim() || null;
       const password = document.getElementById("u-password").value;
-      const role = document.getElementById("u-role").value;
+      let role = document.getElementById("u-role").value;
+      const ownerRaw = document.getElementById("u-owner") ? document.getElementById("u-owner").value : "";
+
+      let payload = { username, password, full_name, role };
+      if (role === "multivers") {
+        payload.role = "admin";
+        payload.is_super_admin = 1;
+      }
+      if (isMulti && ownerRaw) {
+        payload.owner_user_id = parseInt(ownerRaw, 10);
+      }
+
       if (!username || !password) { toast("Username & password wajib diisi", "error"); return; }
       if (password.length < 6) { toast("Password minimal 6 karakter", "error"); return; }
       try {
-        await api("/users", { method: "POST",
-          body: JSON.stringify({ username, password, full_name, role }) });
+        await api("/users", { method: "POST", body: JSON.stringify(payload) });
         toast("User berhasil ditambahkan", "success");
         closeModal(); loadUsers();
       } catch (e) { toast(e.message, "error"); }
@@ -2865,51 +2936,81 @@ function openUserCreate() {
 
 // =================== MODAL EDIT USER ===================
 async function openUserEdit(userId) {
-  let u;
+  let u, allUsers;
   try {
-    const users = await api("/users");
-    u = users.find(x => x.id === userId);
+    allUsers = await api("/users");
+    u = allUsers.find(x => x.id === userId);
     if (!u) { toast("User tidak ditemukan", "error"); return; }
   } catch (e) { toast(e.message, "error"); return; }
 
   const isSelf = u.username === CURRENT_USER.username;
-  openModal(`Edit User — ${u.username}`, `
-    <div class="form-group"><label>Username</label><input value="${escapeHtml(u.username)}" disabled style="opacity:0.6"></div>
-    <div class="form-group"><label>Nama Lengkap</label><input id="ue-fullname" value="${escapeHtml(u.full_name || "")}"></div>
-    <div class="form-group"><label>Role</label>
-      <select id="ue-role">
-        <option value="admin" ${u.role === "admin" ? "selected" : ""}>Admin (15)</option>
-        <option value="operator" ${u.role === "operator" ? "selected" : ""}>Operator (10)</option>
-        <option value="field_tech" ${u.role === "field_tech" ? "selected" : ""}>Field Tech (8)</option>
-        <option value="viewer" ${u.role === "viewer" ? "selected" : ""}>Viewer (5)</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label>Status Akun</label>
-      <select id="ue-active" ${isSelf ? 'disabled style="opacity:0.6"' : ''}>
-        <option value="true" ${u.is_active ? "selected" : ""}>Aktif</option>
-        <option value="false" ${!u.is_active ? "selected" : ""}>Nonaktif (tidak bisa login)</option>
-      </select>
-      ${isSelf ? '<div style="font-size:11px;color:var(--yellow);margin-top:4px">Tidak bisa menonaktifkan akun sendiri</div>' : ''}
-    </div>
-    <div style="background:var(--bg);padding:10px 14px;border-radius:8px;font-size:11px;color:var(--text-dim);line-height:1.5">
-      <i class="fas fa-info-circle"></i> Perubahan role atau status akan <b>menginvalidasi token</b> user tersebut. Mereka harus login ulang.
-    </div>
-  `, [
+  const isMulti = CURRENT_USER.is_super_admin === 1;
+  const targetIsMulti = u.is_super_admin === 1;
+
+  // Dropdown role — opsi "multivers" cuma untuk requester Multivers
+  const roleOpts = [];
+  if (isMulti) {
+    roleOpts.push('<option value="multivers" ' + (targetIsMulti ? 'selected' : '') + '>👑 Multivers (lihat semua OLT)</option>');
+  }
+  roleOpts.push('<option value="admin" ' + (!targetIsMulti && u.role === "admin" ? 'selected' : '') + '>Admin (15)</option>');
+  roleOpts.push('<option value="operator" ' + (!targetIsMulti && u.role === "operator" ? 'selected' : '') + '>Operator (10)</option>');
+  roleOpts.push('<option value="field_tech" ' + (!targetIsMulti && u.role === "field_tech" ? 'selected' : '') + '>Field Tech (8)</option>');
+  roleOpts.push('<option value="viewer" ' + (!targetIsMulti && u.role === "viewer" ? 'selected' : '') + '>Viewer (5)</option>');
+
+  // Owner dropdown (hanya untuk requester Multivers + target bukan Multivers)
+  let ownerField = '';
+  if (isMulti && !targetIsMulti) {
+    const owners = allUsers.filter(x => x.role === "admin" && !x.is_super_admin && x.id !== u.id);
+    const ownerOpts = '<option value="">— Tidak ada —</option>' +
+      owners.map(o => '<option value="' + o.id + '" ' + (u.owner_user_id === o.id ? 'selected' : '') + '>' + escapeHtml(o.username) + ' (' + escapeHtml(o.full_name || "") + ')</option>').join("");
+    ownerField = '<div class="form-group"><label>Atasan / Owner</label>' +
+      '<select id="ue-owner">' + ownerOpts + '</select></div>';
+  }
+
+  openModal("Edit User — " + u.username,
+    '<div class="form-group"><label>Username</label><input value="' + escapeHtml(u.username) + '" disabled style="opacity:0.6"></div>' +
+    '<div class="form-group"><label>Nama Lengkap</label><input id="ue-fullname" value="' + escapeHtml(u.full_name || "") + '"></div>' +
+    '<div class="form-group"><label>Role</label><select id="ue-role">' + roleOpts.join("") + '</select></div>' +
+    ownerField +
+    '<div class="form-group"><label>Status Akun</label>' +
+      '<select id="ue-active" ' + (isSelf ? 'disabled style="opacity:0.6"' : '') + '>' +
+        '<option value="true" ' + (u.is_active ? 'selected' : '') + '>Aktif</option>' +
+        '<option value="false" ' + (!u.is_active ? 'selected' : '') + '>Nonaktif (tidak bisa login)</option>' +
+      '</select>' +
+      (isSelf ? '<div style="font-size:11px;color:var(--yellow);margin-top:4px">Tidak bisa menonaktifkan akun sendiri</div>' : '') +
+    '</div>' +
+    '<div style="background:var(--bg);padding:10px 14px;border-radius:8px;font-size:11px;color:var(--text-dim);line-height:1.5">' +
+      '<i class="fas fa-info-circle"></i> Perubahan role atau status akan <b>menginvalidasi token</b> user tersebut. Mereka harus login ulang.' +
+    '</div>'
+  , [
     { label: "Batal", cls: "btn-secondary", action: closeModal },
     { label: "Simpan", cls: "btn-primary", action: async () => {
       const full_name = document.getElementById("ue-fullname").value.trim() || null;
-      const role = document.getElementById("ue-role").value;
+      let role = document.getElementById("ue-role").value;
       const is_active = document.getElementById("ue-active").value === "true";
+      const ownerEl = document.getElementById("ue-owner");
+
+      let payload = { full_name, role, is_active };
+      if (role === "multivers") {
+        payload.role = "admin";
+        payload.is_super_admin = 1;
+      } else if (targetIsMulti) {
+        // Downgrade dari Multivers: kirim is_super_admin=0
+        payload.is_super_admin = 0;
+      }
+      if (ownerEl) {
+        const ownerRaw = ownerEl.value;
+        payload.owner_user_id = ownerRaw ? parseInt(ownerRaw, 10) : null;
+      }
+
       try {
-        await api(`/users/${userId}`, { method: "PUT",
-          body: JSON.stringify({ full_name, role, is_active }) });
+        await api("/users/" + userId, { method: "PUT", body: JSON.stringify(payload) });
         toast("User berhasil diupdate", "success");
         closeModal(); loadUsers();
       } catch (e) {
         let msg = e.message;
         try { const p = JSON.parse(msg); msg = p.detail || p.message || msg; } catch (_) {}
-        toast(`Gagal: ${msg}`, "error");
+        toast("Gagal: " + msg, "error");
       }
     }},
   ]);

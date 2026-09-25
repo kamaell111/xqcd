@@ -1859,3 +1859,48 @@ html[data-theme="light"] #mem-bar {
   max-height: 120px;
   overflow-y: auto;
 }
+
+/* ============================================================
+   Phase B: badge Multivers + owner badge
+   ============================================================ */
+.multivers-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  background: linear-gradient(120deg, rgba(152,115,255,.18), rgba(45,212,238,.14));
+  color: var(--violet);
+  border: 1px solid var(--violet-ring);
+}
+.multivers-badge i {
+  font-size: 11px;
+}
+html[data-theme=\"light\"] .multivers-badge {
+  background: linear-gradient(120deg, rgba(124,58,237,.12), rgba(14,116,144,.10));
+  color: #6d28d9;
+  border-color: rgba(124,58,237,.32);
+}
+
+/* Owner badge di OLT card */
+.olt-card-owner {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.olt-card-owner.multivers {
+  background: var(--violet-soft);
+  color: var(--violet);
+  border-color: var(--violet-ring);
+}

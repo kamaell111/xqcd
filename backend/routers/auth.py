@@ -32,5 +32,12 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
 
 @router.get("/me")
 def me(user: User = Depends(get_current_user)):
-    return {"id": user.id, "username": user.username,
-            "privilege": user.privilege, "role": user.role}
+    return {
+        "id": user.id,
+        "username": user.username,
+        "privilege": user.privilege,
+        "role": user.role,
+        "full_name": user.full_name,
+        "is_super_admin": user.is_super_admin or 0,
+        "owner_user_id": user.owner_user_id,
+    }
