@@ -52,6 +52,7 @@ def test_olt_connection(req: OLTTestRequest,
             enable_password=req.enable_password or "",
             port=req.port,
             protocol=req.protocol or "telnet",
+            fast_test=True,  # 1a-1: timeout cepat, retry 1x, jangan blok UI 90s
         )
         result = client.test_connection()
         if result.get("ok") and result.get("output"):

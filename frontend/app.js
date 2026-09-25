@@ -824,28 +824,312 @@ async function drawChart() {
 document.getElementById("chart-range")?.addEventListener("change", drawChart);
 
 // =================== OLT ===================
-async function loadOLTs(opts = {}) {
-  const el = document.getElementById("olt-list");
+// =================== OLT MANAGEMENT (1a-1c) ===================
+let _oltDriversCache = null;
+
+async function _getOltDrivers() {
+  if (_oltDriversCache) return _oltDriversCache;
   try {
-    const olts = await api("/olts", opts);
-    el.innerHTML = olts.map(o => `
-      <div class="widget">
-        <div class="widget-header">
-          <h3><i class="fas fa-server"></i> ${escapeHtml(o.hostname)} <span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(o.status)}</span></h3>
-        </div>
-        <table>
-          <tr><td>IP Address</td><td><code>${escapeHtml(o.ip_address)}</code></td></tr>
-          <tr><td>Model / Firmware</td><td>${escapeHtml(o.model)} / ${escapeHtml(o.firmware)}</td></tr>
-          <tr><td>CPU / Memory</td><td>${o.cpu_usage?.toFixed(1) ?? "-"}% / ${o.memory_usage?.toFixed(1) ?? "-"}%</td></tr>
-          <tr><td>Uptime</td><td>${formatUptime(o.uptime_seconds)}</td></tr>
-          <tr><td>Location</td><td>${escapeHtml(o.location || "-")}</td></tr>
-        </table>
-      </div>
-    `).join("");
+    _oltDriversCache = await api("/olts/drivers");
+    return _oltDriversCache;
   } catch (e) {
-    if (e.name !== "AbortError") toast(e.message, "error");
+    toast("Gagal ambil daftar driver: " + e.message, "error");
+    return [];
   }
 }
+
+function _oltStatusClass(status) {
+  if (status === "online") return "online";
+  if (status === "offline") return "offline";
+  if (status === "degraded") return "degraded";
+  return "unknown";
+}
+
+function _miniBarClass(val) {
+  if (val == null) return "";
+  if (val >= 90) return "critical";
+  if (val >= 75) return "warn";
+  return "";
+}
+
+function _vendorLabel(driverKey) {
+  if (!driverKey) return "ZTE";
+  if (driverKey.startsWith("zte")) return "ZTE";
+  if (driverKey.startsWith("huawei")) return "HUAWEI";
+  if (driverKey.startsWith("nokia")) return "NOKIA";
+  return driverKey.split("_")[0].toUpperCase();
+}
+
+async function loadOLTs(opts = {}) {
+  const el = document.getElementById("olt-list");
+  if (!el) return;
+  el.innerHTML = '<div class="olt-empty"><i class="fas fa-spinner fa-spin"></i><p>Memuat OLT...</p></div>';
+  try {
+    const olts = await api("/olts", opts);
+    if (!olts.length) {
+      el.innerHTML = '<div class="olt-empty">' +
+        '<i class="fas fa-server"></i>' +
+        '<h3>Belum ada OLT terdaftar</h3>' +
+        '<p>Tambahkan OLT pertama untuk mulai monitoring.</p>' +
+        '<button class="btn-primary" onclick="openOltModal()"><i class="fas fa-plus"></i> Add New OLT</button>' +
+        '</div>';
+      return;
+    }
+    el.innerHTML = '<div class="olt-grid">' + olts.map(_renderOltCard).join("") + '</div>';
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      el.innerHTML = '<div class="olt-empty"><i class="fas fa-exclamation-triangle"></i><p>Gagal memuat: ' + escapeHtml(e.message) + '</p></div>';
+    }
+  }
+}
+
+function _renderOltCard(o) {
+  const cpuVal = o.cpu_usage != null ? o.cpu_usage : null;
+  const memVal = o.memory_usage != null ? o.memory_usage : null;
+  const cpuBar = _miniBarClass(cpuVal);
+  const memBar = _miniBarClass(memVal);
+  const isDisabled = o.enabled === 0;
+  const isAdmin = CURRENT_USER.privilege >= 15;
+  const isOp = CURRENT_USER.privilege >= 10;
+  const vendor = _vendorLabel(o.driver);
+
+  let actions = '';
+  if (isAdmin) {
+    actions += '<button class="btn-ghost" onclick="openOltEditModal(' + o.id + ')"><i class="fas fa-edit"></i> Edit</button>';
+    actions += '<button class="btn-ghost" onclick="toggleOltEnabled(' + o.id + ', ' + (o.enabled != null ? o.enabled : 1) + ')"><i class="fas fa-power-off"></i> ' + (isDisabled ? 'Enable' : 'Disable') + '</button>';
+    actions += '<button class="btn-danger" onclick="deleteOltConfirm(' + o.id + ', &quot;' + escapeHtml(o.hostname) + '&quot;)"><i class="fas fa-trash"></i> Remove</button>';
+  } else if (isOp) {
+    actions += '<button class="btn-ghost" onclick="openOltEditModal(' + o.id + ')"><i class="fas fa-eye"></i> View</button>';
+  }
+
+  return '<div class="olt-card ' + (isDisabled ? 'olt-disabled' : '') + '">' +
+    '<div class="olt-card-head">' +
+      '<div class="olt-card-icon"><i class="fas fa-server"></i></div>' +
+      '<div class="olt-card-name">' + escapeHtml(o.hostname || "OLT") + '</div>' +
+      '<span class="olt-card-vendor">' + escapeHtml(vendor) + '</span>' +
+      '<span class="olt-card-status ' + _oltStatusClass(o.status) + '"><span class="dot"></span>' + escapeHtml(o.status || "unknown") + '</span>' +
+    '</div>' +
+    '<div class="olt-card-body">' +
+      '<div class="olt-row"><div class="olt-row-label">IP / Port</div><div class="olt-row-value"><code>' + escapeHtml(o.ip_address) + ':' + (o.port || 23) + '</code></div></div>' +
+      '<div class="olt-row"><div class="olt-row-label">Model / FW</div><div class="olt-row-value">' + escapeHtml(o.model || "-") + ' / ' + escapeHtml(o.firmware || "-") + '</div></div>' +
+      '<div class="olt-row"><div class="olt-row-label">CPU</div><div class="olt-row-value"><span class="olt-mini-bar ' + cpuBar + '"><span style="width:' + (cpuVal || 0) + '%"></span></span>' + (cpuVal != null ? cpuVal.toFixed(1) + '%' : '-') + '</div></div>' +
+      '<div class="olt-row"><div class="olt-row-label">Memory</div><div class="olt-row-value"><span class="olt-mini-bar ' + memBar + '"><span style="width:' + (memVal || 0) + '%"></span></span>' + (memVal != null ? memVal.toFixed(1) + '%' : '-') + '</div></div>' +
+      '<div class="olt-row"><div class="olt-row-label">Uptime</div><div class="olt-row-value">' + formatUptime(o.uptime_seconds) + '</div></div>' +
+      '<div class="olt-row"><div class="olt-row-label">Location</div><div class="olt-row-value">' + escapeHtml(o.location || "-") + '</div></div>' +
+    '</div>' +
+    '<div class="olt-card-actions">' + actions + '</div>' +
+  '</div>';
+}
+
+async function openOltModal() {
+  if (CURRENT_USER.privilege < 15) { toast("Hanya admin yang bisa tambah OLT", "error"); return; }
+  const drivers = await _getOltDrivers();
+  if (!drivers.length) { toast("Tidak ada driver tersedia", "error"); return; }
+  _renderOltModal({ mode: "add", drivers, olt: null });
+}
+
+async function openOltEditModal(id) {
+  if (CURRENT_USER.privilege < 15) { toast("Hanya admin yang bisa edit OLT", "error"); return; }
+  try {
+    const olt = await api("/olts/" + id);
+    const drivers = await _getOltDrivers();
+    _renderOltModal({ mode: "edit", drivers, olt });
+  } catch (e) {
+    toast("Gagal load OLT: " + e.message, "error");
+  }
+}
+
+function _renderOltModal(info) {
+  const isEdit = info.mode === "edit";
+  const v = info.olt || {};
+  const drivers = info.drivers;
+
+  const driverOpts = drivers.map(function(d) {
+    const selected = (v.driver || "zte_zxan") === d.key ? " selected" : "";
+    const exp = d.verified ? "" : " (Experimental)";
+    return '<option value="' + d.key + '"' + selected + '>' + escapeHtml(d.label) + exp + '</option>';
+  }).join("");
+
+  const activeDriver = drivers.find(function(d){ return d.key === (v.driver || "zte_zxan"); }) || drivers[0];
+  const hwOptions = (activeDriver ? activeDriver.hardware : []).map(function(h) {
+    const selected = (v.hardware_type || "zte-c320") === h.key ? " selected" : "";
+    return '<option value="' + h.key + '"' + selected + '>' + escapeHtml(h.label) + '</option>';
+  }).join("");
+
+  const pwPlaceholder = isEdit ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (kosongkan jika tidak diubah)" : "Masukkan Password Telnet";
+
+  const bodyHTML =
+    '<div class="form-group"><label>OLT Name</label><input id="olt-hostname" type="text" placeholder="Contoh: OLT-UTAMA-01" value="' + escapeHtml(v.hostname || "") + '"></div>' +
+    '<div class="form-group"><label>IP Address</label><input id="olt-ip" type="text" placeholder="Contoh: 192.168.1.100" value="' + escapeHtml(v.ip_address || "") + '"></div>' +
+    '<div class="form-group"><label>Type &amp; Hardware (Driver)</label><select id="olt-driver">' + driverOpts + '</select></div>' +
+    '<div class="form-group"><label>Hardware Type</label><select id="olt-hardware">' + hwOptions + '</select></div>' +
+    '<h4 style="margin:20px 0 10px;font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em">SNMP</h4>' +
+    '<div class="form-group"><label>Community RO</label><input id="olt-snmp-ro" type="text" placeholder="public" value="' + escapeHtml(v.snmp_community_ro || "public") + '"></div>' +
+    '<div class="form-group"><label>SNMP Port</label><input id="olt-snmp-port" type="number" min="1" max="65535" value="' + (v.snmp_port || 161) + '"></div>' +
+    '<h4 style="margin:20px 0 10px;font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em">Telnet</h4>' +
+    '<div class="form-group"><label>Username</label><input id="olt-username" type="text" value="' + escapeHtml(v.username || "") + '"></div>' +
+    '<div class="form-group"><label>Password</label><input id="olt-password" type="password" placeholder="' + pwPlaceholder + '" value=""></div>' +
+    '<div class="form-group"><label>Enable Password (opsional)</label><input id="olt-enable" type="password" placeholder="' + (isEdit ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (kosongkan jika tidak diubah)" : "zxr10") + '" value=""></div>' +
+    '<div class="form-group"><label>Port</label><input id="olt-port" type="number" min="1" max="65535" value="' + (v.port || 23) + '"></div>' +
+    '<div class="form-group"><label>Location (opsional)</label><input id="olt-location" type="text" value="' + escapeHtml(v.location || "") + '"></div>' +
+    '<div id="olt-test-result" class="olt-test-result"></div>';
+
+  openModal(isEdit ? ("Edit OLT: " + (v.hostname || "")) : "OLT Connection Settings", bodyHTML, [
+    { label: "Close", cls: "btn-secondary", action: closeModal },
+    { label: "\u26A1 Test Connection", cls: "btn-ghost", action: function(){ _testOltConnection(isEdit ? v.id : null); } },
+    { label: "Submit", cls: "btn-primary", action: function(){ _submitOltForm(info.mode, isEdit ? v.id : null); } },
+  ]);
+
+  const drvSel = document.getElementById("olt-driver");
+  const hwSel = document.getElementById("olt-hardware");
+  if (drvSel && hwSel) {
+    drvSel.addEventListener("change", function() {
+      const d = drivers.find(function(x){ return x.key === drvSel.value; });
+      hwSel.innerHTML = (d ? d.hardware : []).map(function(h) {
+        return '<option value="' + h.key + '">' + escapeHtml(h.label) + '</option>';
+      }).join("");
+    });
+  }
+}
+
+async function _testOltConnection(oltId) {
+  const ip = (document.getElementById("olt-ip") || {}).value || "";
+  const port = parseInt((document.getElementById("olt-port") || {}).value || "23", 10);
+  const user = (document.getElementById("olt-username") || {}).value || "";
+  const pass = (document.getElementById("olt-password") || {}).value || "";
+  const enable = (document.getElementById("olt-enable") || {}).value || "";
+  const result = document.getElementById("olt-test-result");
+  if (!result) return;
+
+  if (!ip.trim() || !user.trim()) {
+    result.className = "olt-test-result show err";
+    result.innerHTML = "<b>Lengkapi IP dan Username dulu</b>";
+    return;
+  }
+  if (!pass) {
+    result.className = "olt-test-result show err";
+    result.innerHTML = "<b>Password wajib diisi untuk test</b>";
+    return;
+  }
+
+  result.className = "olt-test-result show";
+  result.style.background = "var(--surface-2)";
+  result.style.color = "var(--text-dim)";
+  result.style.border = "1px solid var(--border)";
+  result.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menguji koneksi...';
+
+  try {
+    const res = await api("/olts/test-connection", {
+      method: "POST",
+      body: JSON.stringify({
+        ip_address: ip.trim(),
+        port: port,
+        username: user.trim(),
+        password: pass,
+        enable_password: enable || null,
+        protocol: "telnet",
+      }),
+    });
+    if (res.ok) {
+      result.className = "olt-test-result show ok";
+      result.style.background = "";
+      result.style.color = "";
+      result.style.border = "";
+      result.innerHTML =
+        '<b><i class="fas fa-check-circle"></i> Koneksi berhasil</b>' +
+        'Hostname: <b>' + escapeHtml(res.hostname || "-") + '</b><br>' +
+        'Model: ' + escapeHtml(res.model || "-") + '<br>' +
+        'Firmware: ' + escapeHtml(res.firmware || "-");
+    } else {
+      result.className = "olt-test-result show err";
+      result.style.background = "";
+      result.style.color = "";
+      result.style.border = "";
+      result.innerHTML =
+        '<b><i class="fas fa-times-circle"></i> Koneksi gagal</b>' +
+        '<code>' + escapeHtml(res.error || "Unknown error") + '</code>';
+    }
+  } catch (e) {
+    result.className = "olt-test-result show err";
+    result.style.background = "";
+    result.style.color = "";
+    result.style.border = "";
+    result.innerHTML = '<b><i class="fas fa-times-circle"></i> Error</b><code>' + escapeHtml(e.message) + '</code>';
+  }
+}
+
+async function _submitOltForm(mode, oltId) {
+  const isEdit = mode === "edit";
+  const payload = {
+    hostname: ((document.getElementById("olt-hostname") || {}).value || "").trim(),
+    ip_address: ((document.getElementById("olt-ip") || {}).value || "").trim(),
+    port: parseInt((document.getElementById("olt-port") || {}).value || "23", 10),
+    username: ((document.getElementById("olt-username") || {}).value || "").trim(),
+    password: (document.getElementById("olt-password") || {}).value || "",
+    enable_password: (document.getElementById("olt-enable") || {}).value || "",
+    snmp_community_ro: ((document.getElementById("olt-snmp-ro") || {}).value || "").trim() || "public",
+    snmp_port: parseInt((document.getElementById("olt-snmp-port") || {}).value || "161", 10),
+    driver: (document.getElementById("olt-driver") || {}).value,
+    hardware_type: (document.getElementById("olt-hardware") || {}).value,
+    location: ((document.getElementById("olt-location") || {}).value || "").trim() || null,
+  };
+
+  if (!payload.hostname || !payload.ip_address || !payload.username) {
+    toast("Hostname, IP, dan Username wajib diisi", "error");
+    return;
+  }
+  if (!isEdit && !payload.password) {
+    toast("Password wajib diisi untuk OLT baru", "error");
+    return;
+  }
+  if (isEdit) {
+    if (!payload.password) delete payload.password;
+    if (!payload.enable_password) delete payload.enable_password;
+  }
+
+  try {
+    if (isEdit) {
+      await api("/olts/" + oltId, { method: "PATCH", body: JSON.stringify(payload) });
+      toast("OLT berhasil diupdate", "success");
+    } else {
+      await api("/olts", { method: "POST", body: JSON.stringify(payload) });
+      toast("OLT berhasil ditambahkan", "success");
+    }
+    closeModal();
+    _oltDriversCache = null;
+    await loadOLTs();
+  } catch (e) {
+    toast("Gagal simpan: " + e.message, "error");
+  }
+}
+
+async function deleteOltConfirm(id, hostname) {
+  if (CURRENT_USER.privilege < 15) { toast("Hanya admin", "error"); return; }
+  const ok = confirm('Hapus OLT "' + hostname + '"?\n\nSemua data terkait (ONU, VLAN, event, alert) akan hilang dan tidak bisa dikembalikan.');
+  if (!ok) return;
+  try {
+    await api("/olts/" + id, { method: "DELETE" });
+    toast('OLT "' + hostname + '" dihapus', "success");
+    await loadOLTs();
+  } catch (e) {
+    toast("Gagal hapus: " + e.message, "error");
+  }
+}
+
+async function toggleOltEnabled(id, currentEnabled) {
+  if (CURRENT_USER.privilege < 15) { toast("Hanya admin", "error"); return; }
+  const newEnabled = currentEnabled === 0 ? 1 : 0;
+  try {
+    await api("/olts/" + id, { method: "PATCH", body: JSON.stringify({ enabled: newEnabled }) });
+    toast(newEnabled ? "OLT diaktifkan" : "OLT dinonaktifkan (polling berhenti)", "success");
+    await loadOLTs();
+  } catch (e) {
+    toast("Gagal: " + e.message, "error");
+  }
+}
+
+document.getElementById("btn-add-olt")?.addEventListener("click", openOltModal);
+document.getElementById("btn-refresh-olts")?.addEventListener("click", function(){ loadOLTs(); });
 
 // =================== PON ===================
 async function loadPONDetail(opts = {}) {

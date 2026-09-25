@@ -65,7 +65,7 @@ def evict_connection(host: str, port: int, username: str = None):
 
 
 def _get_or_create(host, port, username, password, enable_password, protocol, timeout,
-                   device_type):
+                   device_type, max_retries=3):
     key = (host, port, username, _pw_hash(password))
 
     # Try cache
@@ -105,22 +105,22 @@ def _get_or_create(host, port, username, password, enable_password, protocol, ti
     if enable_password:
         params["secret"] = enable_password
 
-    # ⭐ Retry ConnectHandler 3x dengan backoff (transport error only)
+    # ⭐ Retry ConnectHandler dengan backoff
     conn = None
     last_err = None
-    for attempt in range(3):
+    for attempt in range(max_retries):
         try:
             conn = ConnectHandler(**params)
             break
         except Exception as e:
             last_err = e
-            wait = 2 ** attempt   # 1s, 2s, 4s
-            print(f"[OLT-CONNECT] {host}:{port} attempt {attempt+1}/3 gagal: {e}")
-            if attempt < 2:
+            wait = 2 ** attempt
+            print(f"[OLT-CONNECT] {host}:{port} attempt {attempt+1}/{max_retries} gagal: {e}")
+            if attempt < max_retries - 1:
                 _time.sleep(wait)
 
     if conn is None:
-        raise RuntimeError(f"Gagal connect ke {host}:{port} setelah 3x: {last_err}")
+        raise RuntimeError(f"Gagal connect ke {host}:{port} setelah {max_retries}x: {last_err}")
 
     if enable_password:
         try:
@@ -165,7 +165,7 @@ class OLTClient:
 
     def __init__(self, host, username, password,
                  enable_password=None, port=23, protocol="telnet",
-                 timeout=30):
+                 timeout=30, fast_test=False):
         self.host = host
         self.username = username
         self.password = password
@@ -173,6 +173,7 @@ class OLTClient:
         self.port = port
         self.protocol = (protocol or "telnet").lower()
         self.timeout = timeout
+        self.fast_test = fast_test
 
     # ---------- internal ----------
     def _device_type(self) -> str:
@@ -180,6 +181,13 @@ class OLTClient:
 
     def _connect(self):
         """Ambil koneksi dari cache atau buat baru."""
+        # fast_test: retry 1x saja + timeout lebih pendek (untuk Test Connection UI)
+        if self.fast_test:
+            return _get_or_create(
+                self.host, self.port, self.username, self.password,
+                self.enable_password, self.protocol, min(self.timeout, 15),
+                self._device_type(), max_retries=1,
+            )
         return _get_or_create(
             self.host, self.port, self.username, self.password,
             self.enable_password, self.protocol, self.timeout,
