@@ -5,6 +5,7 @@ from database import get_db
 from models import OLT, User
 from schemas import OLTCreate, OLTOut, OLTUpdate, OLTTestRequest
 from auth import get_current_user, require_privilege, audit
+from tenancy import OwnerContext, get_owner_ctx, scoped_olts, get_olt_or_403
 from olt_manager import olt_manager
 from drivers import list_drivers, is_valid as is_driver_valid
 
@@ -12,8 +13,8 @@ router = APIRouter(prefix="/api/v1/olts", tags=["olts"])
 
 
 @router.get("", response_model=List[OLTOut])
-def list_olts(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return db.query(OLT).all()
+def list_olts(db: Session = Depends(get_db), ctx: OwnerContext = Depends(get_owner_ctx)):
+    return scoped_olts(db, ctx).all()
 
 
 @router.post("", response_model=OLTOut)
@@ -69,11 +70,8 @@ def test_olt_connection(req: OLTTestRequest,
 
 
 @router.get("/{olt_id}", response_model=OLTOut)
-def get_olt(olt_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    return olt
+def get_olt(olt_id: int, db: Session = Depends(get_db), ctx: OwnerContext = Depends(get_owner_ctx)):
+    return get_olt_or_403(db, olt_id, ctx)
 
 
 @router.post("/{olt_id}/config/commit")
