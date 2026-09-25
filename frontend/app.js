@@ -1782,7 +1782,7 @@ async function loadWizardInventory() {
 async function openSNPicker() {
   let data;
   try {
-    data = await api("/onu/uncfg");
+    data = await api(`/onu/uncfg?olt_id=${CURRENT_OLT_ID}`);
   } catch (e) {
     toast(`Gagal ambil uncfg: ${e.message}`, "error");
     return;

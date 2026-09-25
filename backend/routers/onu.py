@@ -10,6 +10,7 @@ from auth import get_current_user, require_privilege, audit
 from zxan_parser import generate_onu_config
 from olt_client import OLTClient
 from olt_manager import olt_locked, olt_manager
+from tenancy import OwnerContext, get_owner_ctx, get_olt_or_403, require_olt_access
 
 router = APIRouter(prefix="/api/v1/onu", tags=["onu"])
 
@@ -29,12 +30,11 @@ def _make_client(olt: OLT) -> OLTClient:
 def provision_onu_start(req: ONUProvisionRequest,
                         background_tasks: BackgroundTasks,
                         db: Session = Depends(get_db),
+                        ctx: OwnerContext = Depends(get_owner_ctx),
                         user: User = Depends(require_privilege(10))):
     """Bikin job provisioning ONU — return instan (<1 detik).
     Proses aktual jalan di background. Poll GET /api/v1/jobs/{job_id}."""
-    olt = db.query(OLT).get(req.olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
+    olt = get_olt_or_403(db, req.olt_id, ctx)  # 403 kalau bukan milik user
 
     # Cek SN duplikat
     if db.query(ONU).filter(ONU.olt_id == req.olt_id,
@@ -81,12 +81,12 @@ def provision_onu_start(req: ONUProvisionRequest,
 
 # =================== INVENTORY ===================
 @router.get("/inventory")
-def get_inventory(olt_id: int = 1, db: Session = Depends(get_db),
+def get_inventory(olt_id: int,
+                  db: Session = Depends(get_db),
+                  ctx: OwnerContext = Depends(get_owner_ctx),
                   user: User = Depends(get_current_user)):
     """Daftar untuk dropdown dinamis di wizard."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
+    olt = get_olt_or_403(db, olt_id, ctx)
 
     vlans = db.query(VLAN).filter(VLAN.olt_id == olt_id).order_by(VLAN.vlan_id).all()
     vlan_list = [{"id": v.vlan_id, "name": v.name or f"VLAN{v.vlan_id}"} for v in vlans]
@@ -108,12 +108,16 @@ def get_inventory(olt_id: int = 1, db: Session = Depends(get_db),
 
 
 @router.get("/uncfg")
-def get_uncfg(db: Session = Depends(get_db),
+def get_uncfg(olt_id: int,
+              db: Session = Depends(get_db),
+              ctx: OwnerContext = Depends(get_owner_ctx),
               user: User = Depends(get_current_user)):
-    """Daftar ONU belum terdaftar dari OLT (untuk SN picker)."""
-    olt = db.query(OLT).first()
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
+    """Daftar ONU belum terdaftar dari OLT (untuk SN picker).
+
+    CATATAN: sebelum Phase B2b, endpoint ini pakai db.query(OLT).first()
+    yang salah untuk multi-OLT. Sekarang wajib ?olt_id=.
+    """
+    olt = get_olt_or_403(db, olt_id, ctx)
     try:
         client = _make_client(olt)
         conn = client._connect()
@@ -161,15 +165,15 @@ def get_uncfg(db: Session = Depends(get_db),
 
 # =================== PREFLIGHT + AUTO-ALLOCATE ===================
 @router.post("/preflight")
-def preflight_check(req: ONUProvisionRequest, db: Session = Depends(get_db),
+def preflight_check(req: ONUProvisionRequest,
+                    db: Session = Depends(get_db),
+                    ctx: OwnerContext = Depends(get_owner_ctx),
                     user: User = Depends(get_current_user)):
     """Validasi sebelum provisioning + saran ID kosong."""
     errors, warnings = [], []
     suggestions = {}
 
-    olt = db.query(OLT).get(req.olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
+    olt = get_olt_or_403(db, req.olt_id, ctx)
 
     # SN duplikat
     sn_ex = db.query(ONU).filter(ONU.olt_id == req.olt_id,
@@ -524,9 +528,9 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
 @router.post("/{olt_id}/{onu_id}/reboot")
 @olt_locked
 def reboot_onu(olt_id: int, onu_id: int, db: Session = Depends(get_db),
+               olt: OLT = Depends(require_olt_access),
                user: User = Depends(require_privilege(10))):
-    olt = db.query(OLT).get(olt_id)
-    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    onu = db.query(ONU).filter(ONU.olt_id == olt.id, ONU.onu_id == onu_id).first()
     if not onu:
         raise HTTPException(404, "ONU tidak ditemukan")
     client = _make_client(olt)
@@ -663,9 +667,10 @@ def _do_delete_onu(olt_id: int, onu_id: int, db: Session, username: str,
 def delete_onu_endpoint(olt_id: int, onu_id: int,
                         background_tasks: BackgroundTasks,
                         db: Session = Depends(get_db),
+                        olt: OLT = Depends(require_olt_access),
                         user: User = Depends(require_privilege(15))):
     """Hapus ONU — async job. Return job_id untuk polling."""
-    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    onu = db.query(ONU).filter(ONU.olt_id == olt.id, ONU.onu_id == onu_id).first()
     if not onu:
         raise HTTPException(404, "ONU tidak ditemukan")
 
@@ -708,13 +713,11 @@ def _run_delete_job(job_id: str, olt_id: int, onu_id: int, username: str):
 @router.post("/{olt_id}/{onu_id}/mark-connected")
 @olt_locked
 def mark_connected(olt_id: int, onu_id: int, db: Session = Depends(get_db),
+                   olt: OLT = Depends(require_olt_access),
                    user: User = Depends(require_privilege(10))):
     """Tandai bridge mode = configured (user sudah set PPPoE di GUI modem).
     Mengubah status Internet jadi CONNECTED."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    onu = db.query(ONU).filter(ONU.olt_id == olt.id, ONU.onu_id == onu_id).first()
     if not onu:
         raise HTTPException(404, "ONU tidak ditemukan")
 
@@ -730,13 +733,11 @@ def mark_connected(olt_id: int, onu_id: int, db: Session = Depends(get_db),
 @router.post("/{olt_id}/{onu_id}/mark-disconnected")
 @olt_locked
 def mark_disconnected(olt_id: int, onu_id: int, db: Session = Depends(get_db),
+                      olt: OLT = Depends(require_olt_access),
                       user: User = Depends(require_privilege(10))):
     """Tandai bridge mode = belum dikonfigurasi (user belum set PPPoE di GUI).
     Mengubah status Internet jadi BELUM SETUP."""
-    olt = db.query(OLT).get(olt_id)
-    if not olt:
-        raise HTTPException(404, "OLT tidak ditemukan")
-    onu = db.query(ONU).filter(ONU.olt_id == olt_id, ONU.onu_id == onu_id).first()
+    onu = db.query(ONU).filter(ONU.olt_id == olt.id, ONU.onu_id == onu_id).first()
     if not onu:
         raise HTTPException(404, "ONU tidak ditemukan")
 
