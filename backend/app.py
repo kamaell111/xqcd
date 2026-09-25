@@ -76,9 +76,23 @@ def migrate_db():
             "ALTER TABLE olts ADD COLUMN driver TEXT DEFAULT 'zte_zxan'",
             "ALTER TABLE olts ADD COLUMN hardware_type TEXT DEFAULT 'zte-c320'",
             "ALTER TABLE olts ADD COLUMN enabled INTEGER DEFAULT 1",
+            # Phase A: ownership — NULL = Multivers/JSN pusat
+            "ALTER TABLE olts ADD COLUMN owner_user_id INTEGER REFERENCES users(id)",
+            "ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN owner_user_id INTEGER REFERENCES users(id)",
         ]:
             try:
                 db.execute(text(col_sql))
+            except Exception:
+                pass
+
+        # Phase A: index untuk ownership query
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_olts_owner_user_id ON olts(owner_user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_users_owner_user_id ON users(owner_user_id)",
+        ]:
+            try:
+                db.execute(text(idx_sql))
             except Exception:
                 pass
 

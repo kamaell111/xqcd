@@ -17,6 +17,9 @@ class User(Base):
     role = Column(String(32), default="viewer")
     is_active = Column(Boolean, default=True)
     token_version = Column(Integer, default=0)
+    # Phase A: ownership
+    is_super_admin = Column(Integer, default=0)                             # 1=Multivers, 0=admin biasa
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # untuk operator/viewer: admin atasannya
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
     last_login = Column(DateTime, nullable=True)
@@ -42,9 +45,11 @@ class OLT(Base):
     model = Column(String(32), default="C320")
     firmware = Column(String(32), default="V4.8.35")
     # 1a-1: multi-vendor prep
-    driver = Column(String(32), default="zte_zxan")            # key driver registry
-    hardware_type = Column(String(32), default="zte-c320")     # key hardware di driver
-    enabled = Column(Integer, default=1)                        # 1=aktif, 0=disable polling
+    driver = Column(String(32), default="zte_zxan")
+    hardware_type = Column(String(32), default="zte-c320")
+    enabled = Column(Integer, default=1)
+    # Phase A: ownership — NULL = milik Multivers/JSN pusat
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     location = Column(String(255), nullable=True)
     status = Column(String(16), default="unknown")
     cpu_usage = Column(Float, nullable=True)
