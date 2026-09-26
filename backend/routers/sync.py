@@ -482,6 +482,14 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                 except Exception as e:
                     print(f"[SNMP] gagal: {e} — fallback Telnet untuk optical")
 
+            # ⚡ Pre-parse state untuk tahu mana ONU online (skip PPPoE kalau offline)
+            _onu_state_pre = _parse_onu_state(onu_state_out)
+            online_idxs = set()
+            for _o in _onu_state_pre:
+                if (_o.get("phase_state") or "").lower().strip() == "working":
+                    online_idxs.add(_o["onu_index"])
+            print(f"[SYNC] {len(online_idxs)} ONU online dari {len(_onu_state_pre)} total")
+
             for m in _re2.finditer(r"^\s*(\d+/\d+/\d+:\d+)\s+enable", onu_state_out, _re2.MULTILINE):
                 idx = m.group(1)
                 so = snmp_data.get(idx)
@@ -496,16 +504,24 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                         optical_map[idx] = _parse_attenuation(att_out)
                     except Exception as e:
                         print(f"[OPTICAL] {idx} error: {e}")
-                # PPPoE status (khusus ZTE, Huawei akan error — ok)
-                try:
-                    pppoe_cmd = f"show gpon remote-onu pppoe gpon-onu_{idx}"
-                    pppoe_out = conn.send_command_timing(pppoe_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
-                    if "Error" not in pppoe_out and "Invalid" not in pppoe_out:
-                        pppoe_map[idx] = _parse_remote_pppoe(pppoe_out)
-                    else:
-                        print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
-                except Exception as e:
-                    print(f"[PPPOE] {idx} error: {e}")
+                # PPPoE status — skip kalau ONU tidak online
+                if idx not in online_idxs:
+                    pppoe_map[idx] = {
+                        "status": "disconnected",
+                        "online_duration": 0,
+                        "username": None,
+                        "nat": None,
+                    }
+                else:
+                    try:
+                        pppoe_cmd = f"show gpon remote-onu pppoe gpon-onu_{idx}"
+                        pppoe_out = conn.send_command_timing(pppoe_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
+                        if "Error" not in pppoe_out and "Invalid" not in pppoe_out:
+                            pppoe_map[idx] = _parse_remote_pppoe(pppoe_out)
+                        else:
+                            print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
+                    except Exception as e:
+                        print(f"[PPPOE] {idx} error: {e}")
                 # Detail: distance — SNMP dulu, fallback Telnet
                 if so is not None and so.distance_m is not None:
                     detail_map[idx] = {"distance": so.distance_m, "online_duration": None}
