@@ -90,6 +90,74 @@ def test_olt_connection(req: OLTTestRequest,
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# =================== SNMP (Phase 2) ===================
+
+@router.post("/{olt_id}/test-snmp")
+async def test_snmp(olt: OLT = Depends(require_olt_access),
+                    user: User = Depends(get_current_user)):
+    """Test koneksi SNMP ke OLT + ambil sysDescr + uptime.
+
+    Pakai community dari olt.snmp_community_ro atau fallback 'public'.
+    """
+    from olt_snmp import OltSnmpClient
+    community = olt.snmp_community_ro or "public"
+    port = olt.snmp_port or 161
+
+    client = OltSnmpClient(olt.ip_address, community, port=port)
+    try:
+        result = await client.test_connection()
+        if result.get("ok"):
+            up = await client.get_sys_uptime()
+            result["uptime_seconds"] = up
+            result["community_used"] = community
+        return result
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@router.post("/{olt_id}/sync-snmp")
+async def sync_snmp(olt: OLT = Depends(require_olt_access),
+                    user: User = Depends(get_current_user)):
+    """Walk ONU via SNMP — return JSON untuk verifikasi.
+
+    TIDAK menyentuh DB dulu. Cuma lihat apa yang SNMP kirim.
+    Kalau sudah OK, baru integrate ke _do_sync_pons.
+    """
+    from olt_snmp import OltSnmpClient
+    import time as _t
+
+    community = olt.snmp_community_ro or "public"
+    port = olt.snmp_port or 161
+
+    client = OltSnmpClient(olt.ip_address, community, port=port)
+    t0 = _t.time()
+    try:
+        onus = await client.list_onus()
+        elapsed = round(_t.time() - t0, 2)
+        return {
+            "ok": True,
+            "total": len(onus),
+            "elapsed_seconds": elapsed,
+            "onus": [
+                {
+                    "pon_idx": o.pon_idx,
+                    "onu_id": o.onu_id,
+                    "name": o.name,
+                    "desc": o.desc,
+                    "onu_type": o.onu_type,
+                    "serial_number": o.serial_number,
+                    "status": o.status,
+                    "rx_dbm": o.rx_dbm,
+                    "tx_dbm": o.tx_dbm,
+                    "distance_m": o.distance_m,
+                }
+                for o in onus
+            ],
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @router.get("/{olt_id}", response_model=OLTOut)
 def get_olt(olt_id: int, db: Session = Depends(get_db), ctx: OwnerContext = Depends(get_owner_ctx)):
     return get_olt_or_403(db, olt_id, ctx)
