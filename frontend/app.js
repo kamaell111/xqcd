@@ -104,22 +104,116 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
   }
 });
 
+// =================== RESET STATE ===================
+// Dipanggil saat logout & sebelum showApp — biar tidak ada state nyangkut
+function resetAppState() {
+  // Timers
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  if (recoveryTimer) { clearInterval(recoveryTimer); recoveryTimer = null; }
+  // Time trackers
+  lastRecoveryTs = 0;
+  lastAlertIds = new Set();
+  isFirstAlertPoll = true;
+  // Caches
+  uncfgCache = null;
+  _inventoryCache = null;
+  _oltDriversCache = null;
+  window._oltOwnersCache = null;
+  window._oltFilterLoaded = false;
+  // Chart — destroy biar tidak nyangkut
+  if (cpuChart) {
+    try { cpuChart.destroy(); } catch(_) {}
+    cpuChart = null;
+  }
+  lastCpuValue = null;
+  // Abort pending request
+  if (pageAbortController) {
+    try { pageAbortController.abort(); } catch(_) {}
+    pageAbortController = null;
+  }
+  // Reset OLT aktif
+  CURRENT_OLT_ID = null;
+  localStorage.removeItem("olt_id");
+  // Reset halaman aktif
+  currentPage = "dashboard";
+
+  // ⭐ Job pollers — matikan semua interval job polling
+  if (typeof _jobPollers !== "undefined" && _jobPollers) {
+    Object.keys(_jobPollers).forEach(jid => {
+      try { clearInterval(_jobPollers[jid]); } catch(_) {}
+      delete _jobPollers[jid];
+    });
+  }
+
+  // ⭐ Tutup modal kalau masih terbuka
+  const modal = document.getElementById("modal");
+  if (modal) modal.classList.add("hidden");
+
+  // ⭐ Reset sidebar — hapus semua .active
+  document.querySelectorAll(".sidebar nav a.active").forEach(a => a.classList.remove("active"));
+
+  // ⭐ Reset halaman — sembunyikan semua, biar loadPage pilih ulang
+  document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+
+  console.log("[STATE] reset selesai");
+}
+
 function logout() {
+  resetAppState();
   TOKEN = null;
   CURRENT_USER = null;
   localStorage.removeItem("token");
   localStorage.removeItem("user");
-  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
-  if (recoveryTimer) { clearInterval(recoveryTimer); recoveryTimer = null; }
-  lastRecoveryTs = 0;
-  lastAlertIds = new Set();
-  isFirstAlertPoll = true;
-  if (pageAbortController) pageAbortController.abort();
   document.getElementById("login-screen").classList.remove("hidden");
   document.getElementById("main-screen").classList.add("hidden");
 }
 
 document.getElementById("logout-btn").addEventListener("click", logout);
+
+// =================== OLT SWITCHER ===================
+async function loadOltSwitcher() {
+  const wrap = document.getElementById("olt-switcher-wrap");
+  const sel = document.getElementById("olt-switcher");
+  if (!wrap || !sel) return;
+  try {
+    const olts = await api("/olts");
+    if (!olts.length) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    // Kalau cuma 1 OLT, sembunyikan switcher (tidak berguna)
+    if (olts.length === 1) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    wrap.classList.remove("hidden");
+    sel.innerHTML = olts.map(o => {
+      const badge = o.status === "online" ? "● " : "○ ";
+      const label = (o.hostname || "OLT") + " (" + (o.ip_address || "?") + ")";
+      return '<option value="' + o.id + '">' + badge + label + '</option>';
+    }).join("");
+    if (CURRENT_OLT_ID) sel.value = String(CURRENT_OLT_ID);
+  } catch (e) {
+    console.warn("[SWITCHER] gagal load:", e);
+  }
+}
+
+async function switchOlt(newId) {
+  const id = parseInt(newId, 10);
+  if (!id || id === CURRENT_OLT_ID) return;
+  CURRENT_OLT_ID = id;
+  localStorage.setItem("olt_id", String(id));
+  console.log("[OLT] switch ke id=" + id);
+
+  // Reset cache
+  uncfgCache = null;
+  _inventoryCache = null;
+
+  // Reload halaman aktif
+  const activePage = document.querySelector(".sidebar nav a.active")?.dataset.page || "dashboard";
+  toast("Ganti OLT: memuat ulang...", "info");
+  loadPage(activePage);
+}
 
 async function initCurrentOltId() {
   try {
@@ -143,6 +237,7 @@ async function initCurrentOltId() {
 }
 
 async function showApp() {
+  resetAppState();   // ⭐ bersihkan semua state dari session sebelumnya
   document.getElementById("login-screen").classList.add("hidden");
   document.getElementById("main-screen").classList.remove("hidden");
   document.getElementById("user-name").textContent = CURRENT_USER.username;
@@ -168,6 +263,10 @@ async function showApp() {
   }
 
   await initCurrentOltId();
+  console.log("[APP] initCurrentOltId selesai, id=" + CURRENT_OLT_ID);
+
+  // Load switcher (kalau >1 OLT)
+  await loadOltSwitcher();
 
   if (CURRENT_OLT_ID == null) {
     const isMulti = CURRENT_USER.is_super_admin === 1;
@@ -533,7 +632,7 @@ async function loadOpticalPage(opts = {}) {
     }
 
     el.innerHTML = `
-      <div class="table-wrap"><table class="table-premium">
+      <div class="table-wrap"><table class="table-premium${isCrossOlt ? " table-cross-olt" : ""}">
         <thead><tr>
           <th>#</th><th>Nama</th><th>Serial</th><th>PON</th>
           <th>RX (dBm)</th><th>TX (dBm)</th><th>Distance</th><th>Status</th><th>Kategori</th>
@@ -1326,15 +1425,49 @@ function renderInternetStatus(o) {
   return `<span class="status-badge ${cls}" title="${title}"><i class="fas ${icon}"></i> ${label}</span>`;
 }
 
+// =================== OLT FILTER (Super Admin) ===================
+async function loadOltFilter() {
+  const el = document.getElementById("onu-olt-filter");
+  if (!el) return;
+  // Hanya tampil untuk Super Admin
+  if (!CURRENT_USER || !CURRENT_USER.is_super_admin) {
+    el.classList.add("hidden");
+    return;
+  }
+  try {
+    const olts = await api("/olts");
+    if (olts.length < 1) {
+      el.classList.add("hidden");
+      return;
+    }
+    el.classList.remove("hidden");
+    el.innerHTML = '<option value="all">Semua OLT (' + olts.length + ')</option>' +
+      olts.map(o => '<option value="' + o.id + '">' + escapeHtml(o.hostname) + '</option>').join("");
+  } catch (_) {}
+}
+
 async function loadONUs(opts = {}) {
   const el = document.getElementById("onu-table");
   if (!el) return;
   try {
+    // Lazy-load OLT filter (sekali saja per page-load)
+    if (!window._oltFilterLoaded) {
+      await loadOltFilter();
+      window._oltFilterLoaded = true;
+    }
     const search = document.getElementById("onu-search").value.toLowerCase().trim();
     const status = document.getElementById("onu-status-filter").value;
-    let url = `/olts/${CURRENT_OLT_ID}/onus`;
-    if (status) url += `?status=${status}`;
-    const onus = await api(url, opts);
+    const oltFilterEl = document.getElementById("onu-olt-filter");
+    const oltFilter = oltFilterEl && !oltFilterEl.classList.contains("hidden") ? oltFilterEl.value : null;
+
+    // Selalu pakai global /onus biar olt_hostname selalu ada
+    const isCrossOlt = true;
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+    if (oltFilter && oltFilter !== "all") params.set("olt_id", oltFilter);
+    const qs = params.toString();
+    const onus = await api("/onus" + (qs ? "?" + qs : ""), opts);
+
     const filtered = onus.filter(o => {
       if (!search) return true;
       return (o.serial_number || "").toLowerCase().includes(search)
@@ -1353,14 +1486,30 @@ async function loadONUs(opts = {}) {
     }
 
     el.innerHTML = `
-      <div class="table-wrap"><table class="table-premium">
+      <div class="table-wrap"><table class="table-premium${isCrossOlt ? " table-cross-olt" : ""}">
+        ${isCrossOlt ? `<colgroup>
+          <col style="width:100px">
+          <col style="width:180px">
+          <col style="width:160px">
+          <col style="width:140px">
+          <col style="width:80px">
+          <col style="width:80px">
+          <col style="width:180px">
+          <col style="width:100px">
+          <col style="width:90px">
+          <col style="width:100px">
+          <col style="width:110px">
+          <col style="width:100px">
+        </colgroup>` : ''}
         <thead><tr>
+          ${isCrossOlt ? '<th>OLT</th>' : ''}
           <th>Interface</th><th>Serial Number</th><th>Nama</th><th>Merek</th><th>ONU</th>
           <th>Internet</th><th>RX (dBm)</th><th>Distance</th><th>VLAN</th><th>PPPoE</th><th>Aksi</th>
         </tr></thead>
         <tbody>
           ${filtered.map(o => `
             <tr>
+              ${isCrossOlt ? `<td>${escapeHtml(o.olt_hostname || "?")}</td>` : ''}
               <td><b>${escapeHtml(o.interface_name || `${o.pon_port}:${o.onu_id}`)}</b></td>
               <td><code>${escapeHtml(o.serial_number || "-")}</code></td>
               <td>${escapeHtml(o.name || "-")}</td>
@@ -1372,14 +1521,14 @@ async function loadONUs(opts = {}) {
               <td>${o.user_vlan || "-"} → ${o.vlan || "-"}</td>
               <td>${escapeHtml(o.pppoe_user || "-")}</td>
               <td>
-                <button class="btn-icon" onclick="showONUDetail(${o.onu_id})" title="Detail"><i class="fas fa-eye"></i></button>
+                <button class="btn-icon" onclick="showONUDetail(${o.onu_id}, ${o.olt_id || "null"})" title="Detail"><i class="fas fa-eye"></i></button>
                 ${(o.provisioning_mode === "bridge") ? (
                   o.bridge_configured
-                    ? `<button class="btn-icon" onclick="markDisconnected(${o.onu_id})" title="Tandai Internet Mati" style="color:var(--yellow)"><i class="fas fa-times-circle"></i></button>`
-                    : `<button class="btn-icon" onclick="markConnected(${o.onu_id})" title="Tandai Internet Aktif" style="color:var(--green)"><i class="fas fa-check-circle"></i></button>`
+                    ? `<button class="btn-icon" onclick="markDisconnected(${o.onu_id}, ${o.olt_id || "null"})" title="Tandai Internet Mati" style="color:var(--yellow)"><i class="fas fa-times-circle"></i></button>`
+                    : `<button class="btn-icon" onclick="markConnected(${o.onu_id}, ${o.olt_id || "null"})" title="Tandai Internet Aktif" style="color:var(--green)"><i class="fas fa-check-circle"></i></button>`
                 ) : ""}
-                <button class="btn-icon" onclick="rebootONU(${o.onu_id})" title="Reboot"><i class="fas fa-power-off"></i></button>
-                <button class="btn-icon" onclick="deleteONU(${o.onu_id})" title="Hapus dari OLT" style="color:var(--red)"><i class="fas fa-trash"></i></button>
+                <button class="btn-icon" onclick="rebootONU(${o.onu_id}, ${o.olt_id || "null"})" title="Reboot"><i class="fas fa-power-off"></i></button>
+                <button class="btn-icon" onclick="deleteONU(${o.onu_id}, ${o.olt_id || "null"})" title="Hapus dari OLT" style="color:var(--red)"><i class="fas fa-trash"></i></button>
               </td>
             </tr>
           `).join("")}
@@ -1393,11 +1542,14 @@ async function loadONUs(opts = {}) {
 
 document.getElementById("onu-search")?.addEventListener("input", debounce(loadONUs, 300));
 document.getElementById("onu-status-filter")?.addEventListener("change", loadONUs);
+document.getElementById("onu-olt-filter")?.addEventListener("change", loadONUs);
 
 let CURRENT_ONU_ID = null;
+let CURRENT_ONU_OLT_ID = null;   // OLT tempat ONU yang sedang dibuka
 
-async function showONUDetail(onuId) {
+async function showONUDetail(onuId, oltId = null) {
   CURRENT_ONU_ID = onuId;
+  CURRENT_ONU_OLT_ID = oltId || CURRENT_OLT_ID;
   // Pindah ke halaman detail (bukan modal)
   loadPage("onu-detail");
 }
@@ -1417,7 +1569,7 @@ async function loadONUDetailPage(opts = {}) {
   }
 
   try {
-    const o = await api(`/olts/${CURRENT_OLT_ID}/onus/${CURRENT_ONU_ID}`, opts);
+    const o = await api(`/olts/${CURRENT_ONU_OLT_ID || CURRENT_OLT_ID}/onus/${CURRENT_ONU_ID}`, opts);
     const rx = o.optical_rx;
     let rxCls = "good";
     if (rx != null) {
@@ -1442,14 +1594,14 @@ async function loadONUDetailPage(opts = {}) {
           · ${escapeHtml(o.pon_port || "")}:${o.onu_id}
         </div>
         <div class="onu-detail-actions">
-          <button onclick="rebootONU(${o.onu_id})"><i class="fas fa-power-off"></i> Reboot</button>
+          <button onclick="rebootONU(${o.onu_id}, ${CURRENT_ONU_OLT_ID || CURRENT_OLT_ID})"><i class="fas fa-power-off"></i> Reboot</button>
           ${o.provisioning_mode === "bridge" ? (
             o.bridge_configured
-              ? `<button onclick="markDisconnected(${o.onu_id})"><i class="fas fa-times-circle"></i> Tandai Disconnected</button>`
-              : `<button onclick="markConnected(${o.onu_id})"><i class="fas fa-check-circle"></i> Tandai Connected</button>`
+              ? `<button onclick="markDisconnected(${o.onu_id}, ${CURRENT_ONU_OLT_ID || CURRENT_OLT_ID})"><i class="fas fa-times-circle"></i> Tandai Disconnected</button>`
+              : `<button onclick="markConnected(${o.onu_id}, ${CURRENT_ONU_OLT_ID || CURRENT_OLT_ID})"><i class="fas fa-check-circle"></i> Tandai Connected</button>`
           ) : ""}
           <button onclick="loadONUDetailPage()"><i class="fas fa-sync"></i> Refresh</button>
-          <button class="danger" onclick="deleteONU(${o.onu_id}).then(() => loadPage('onus'))"><i class="fas fa-trash"></i> Hapus</button>
+          <button class="danger" onclick="deleteONU(${o.onu_id}, ${CURRENT_ONU_OLT_ID || CURRENT_OLT_ID}).then(() => loadPage('onus'))"><i class="fas fa-trash"></i> Hapus</button>
         </div>
       </div>
 
@@ -1568,25 +1720,27 @@ async function loadONUDetailPage(opts = {}) {
   }
 }
 
-async function markConnected(onuId) {
+async function markConnected(onuId, oltId = null) {
   if (!confirm("Tandai ONU ini sebagai CONNECTED? (user sudah set PPPoE di GUI modem)")) return;
   try {
-    await api(`/onu/${CURRENT_OLT_ID}/${onuId}/mark-connected`, { method: "POST" });
+    const targetOlt = oltId || CURRENT_OLT_ID;
+    await api(`/onu/${targetOlt}/${onuId}/mark-connected`, { method: "POST" });
     toast("✅ Status: CONNECTED", "success");
     loadONUs();
   } catch (e) { toast(e.message, "error"); }
 }
 
-async function markDisconnected(onuId) {
+async function markDisconnected(onuId, oltId = null) {
   if (!confirm("Tandai ONU ini sebagai BELUM SETUP?")) return;
   try {
-    await api(`/onu/${CURRENT_OLT_ID}/${onuId}/mark-disconnected`, { method: "POST" });
+    const targetOlt = oltId || CURRENT_OLT_ID;
+    await api(`/onu/${targetOlt}/${onuId}/mark-disconnected`, { method: "POST" });
     toast("Status: BELUM SETUP", "warning");
     loadONUs();
   } catch (e) { toast(e.message, "error"); }
 }
 
-async function rebootONU(onuId) {
+async function rebootONU(onuId, oltId = null) {
   let label = `ONU ID ${onuId}`;
   try {
     let onu = _searchCache && _searchCache.find(o => o.onu_id === onuId);
@@ -1607,7 +1761,8 @@ async function rebootONU(onuId) {
     confirmText: "Reboot",
     onConfirm: async () => {
       try {
-        await api(`/onu/${CURRENT_OLT_ID}/${onuId}/reboot`, { method: "POST" });
+        const targetOlt = oltId || CURRENT_OLT_ID;
+        await api(`/onu/${targetOlt}/${onuId}/reboot`, { method: "POST" });
         toast("Perintah reboot terkirim", "success");
         loadONUs();
       } catch (e) { toast(e.message, "error"); }
@@ -1615,7 +1770,7 @@ async function rebootONU(onuId) {
   });
 }
 
-async function deleteONU(onuId) {
+async function deleteONU(onuId, oltId = null) {
   let label = `ONU ID ${onuId}`;
   try {
     let onu = _searchCache && _searchCache.find(o => o.onu_id === onuId);
@@ -1635,7 +1790,8 @@ async function deleteONU(onuId) {
     warning: "Config ONU akan dihapus permanen dari OLT dan database aplikasi. Tidak bisa di-undo.",
     confirmText: "Hapus ONU",
     onConfirm: async () => {
-      await submitJob(`/onu/${CURRENT_OLT_ID}/${onuId}`, {
+      const targetOlt = oltId || CURRENT_OLT_ID;
+      await submitJob(`/onu/${targetOlt}/${onuId}`, {
         method: "DELETE",
         label: "Hapus ONU",
         subject: label,

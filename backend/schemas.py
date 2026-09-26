@@ -178,6 +178,12 @@ class ONUOut(BaseModel):
         from_attributes = True
 
 
+class ONUWithOLTOut(ONUOut):
+    """ONU + info OLT untuk tabel lintas-OLT."""
+    olt_id: int
+    olt_hostname: Optional[str] = None
+
+
 class ONUProvisionRequest(BaseModel):
     olt_id: int
     pon_port: str

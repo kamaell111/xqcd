@@ -14,6 +14,11 @@ from functools import wraps
 from typing import Dict, Any, Optional
 
 
+# =================== CIRCUIT BREAKER CONSTANTS ===================
+CIRCUIT_FAIL_THRESHOLD = 3           # gagal 3x berturut -> buka circuit
+CIRCUIT_BACKOFF_STEPS = [60, 120, 300, 600]   # detik: 1m, 2m, 5m, 10m
+
+
 class OLTManager:
     def __init__(self):
         # Lock per OLT (asyncio.Lock, karena dipakai di async context)

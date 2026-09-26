@@ -1904,3 +1904,101 @@ html[data-theme=\"light\"] .multivers-badge {
   color: var(--violet);
   border-color: var(--violet-ring);
 }
+
+/* ============================================================
+   OLT Switcher — dropdown pilih OLT aktif di topbar
+   ============================================================ */
+.olt-switcher-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  transition: border-color var(--fast), box-shadow var(--fast);
+}
+.olt-switcher-wrap:hover {
+  border-color: var(--accent);
+}
+.olt-switcher-wrap > i {
+  font-size: 11px;
+  color: var(--accent);
+}
+.olt-switcher-wrap select {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  padding-right: 4px;
+  max-width: 200px;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.olt-switcher-wrap select option {
+  background: var(--surface);
+  color: var(--text);
+  padding: 6px;
+}
+.olt-switcher-wrap.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+html[data-theme="light"] .olt-switcher-wrap {
+  background: #fff;
+}
+
+/* Cross-OLT view: chip nama OLT di kolom */
+.olt-chip i {
+  font-size: 9px;
+}
+
+/* Hidden helper */
+.hidden {
+  display: none !important;
+}
+
+
+.table-premium tbody tr td:first-child {
+  background: var(--surface-2);
+  border-right: 2px solid var(--border);
+  font-weight: 600;
+  color: var(--accent);
+  padding-left: 16px !important;
+  padding-right: 16px !important;
+}
+
+
+
+
+
+
+
+
+
+/* ============================================================
+   Kolom OLT — pakai table-layout: fixed + colgroup
+   ============================================================ */
+table.table-cross-olt {
+  table-layout: fixed;
+  width: 100%;
+}
+table.table-cross-olt th,
+table.table-cross-olt td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+table.table-cross-olt th:nth-child(1),
+table.table-cross-olt td:nth-child(1) {
+  background: var(--surface-2);
+  border-right: 1px solid var(--border);
+  color: var(--accent);
+  font-weight: 600;
+  padding-left: 14px;
+  padding-right: 10px;
+}

@@ -16,7 +16,7 @@ import asyncio
 import os
 
 from routers import auth as auth_router
-from routers import olts, monitoring, config, onu, alerts, users, sync, ports, jobs
+from routers import olts, monitoring, config, onu, alerts, users, sync, ports, jobs, global_onus
 
 scheduler = AsyncIOScheduler()
 
@@ -494,6 +494,7 @@ app.include_router(users.router)
 app.include_router(sync.router)
 app.include_router(ports.router)
 app.include_router(jobs.router)
+app.include_router(global_onus.router)
 
 
 @app.get("/api/health")
