@@ -70,6 +70,7 @@
           <a href="#" data-page="pons"><i class="fas fa-broadcast-tower"></i><span>PON Ports</span></a>
           <a href="#" data-page="onus"><i class="fas fa-wifi"></i><span>ONU</span></a>
           <a href="#" data-page="optical"><i class="fas fa-signal"></i><span>Optical</span></a>
+          <a href="#" data-page="traffic"><i class="fas fa-chart-line"></i><span>Traffic</span></a>
         </details>
 
         <details class="nav-group" open>
@@ -397,6 +398,23 @@
           </div>
 
           <div id="optical-table"></div>
+        </section>
+
+        <section class="page" id="page-traffic">
+          <div class="toolbar">
+            <select id="traffic-scope">
+              <option value="pon" selected>PON Ports (16)</option>
+              <option value="uplink">Uplink Ports (6)</option>
+            </select>
+            <select id="traffic-period">
+              <option value="60">1 jam</option>
+              <option value="240" selected>4 jam</option>
+              <option value="1440">24 jam</option>
+              <option value="10080">7 hari</option>
+            </select>
+            <button class="btn-ghost" id="btn-traffic-refresh"><i class="fas fa-sync"></i> Refresh</button>
+          </div>
+          <div id="traffic-grid"></div>
         </section>
 
         <section class="page" id="page-onu-detail">

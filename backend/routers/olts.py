@@ -302,6 +302,94 @@ async def poll_traffic(olt: OLT = Depends(require_olt_access),
 
 
 
+@router.get("/{olt_id}/traffic/recent")
+async def get_traffic_recent(
+    scope: str = "pon",           # 'pon' | 'uplink'
+    minutes: int = 240,           # 4 jam default
+    db: Session = Depends(get_db),
+    olt: OLT = Depends(require_olt_access),
+    user: User = Depends(get_current_user),
+):
+    """Ambil data traffic terbaru per scope.
+
+    Return SEMUA entity di scope itu (PON: 16, Uplink: 6) — termasuk yang
+    belum ada sample (series = []). Supaya frontend bisa render grid lengkap.
+    """
+    from models import TrafficSample
+    from datetime import timedelta
+
+    if scope not in ("pon", "uplink"):
+        raise HTTPException(400, "scope harus 'pon' atau 'uplink'")
+
+    since = datetime.utcnow() - timedelta(minutes=minutes)
+
+    # Query sample dalam range
+    rows = (
+        db.query(TrafficSample)
+        .filter(
+            TrafficSample.olt_id == olt.id,
+            TrafficSample.scope == scope,
+            TrafficSample.ts >= since,
+        )
+        .order_by(TrafficSample.ts.asc())
+        .all()
+    )
+
+    # Group per entity
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r.entity_key, []).append({
+            "ts": int(r.ts.timestamp() * 1000),   # ms untuk Chart.js
+            "rx_bps": r.rx_bps,
+            "tx_bps": r.tx_bps,
+        })
+
+    # Daftar entity lengkap dari IF-MIB (walk cepat via SNMP)
+    from olt_snmp import OltSnmpClient
+    client = OltSnmpClient(olt.ip_address, olt.snmp_community_ro or "public",
+                           port=olt.snmp_port or 161)
+    try:
+        counters = await client.get_port_counters()
+    except Exception:
+        counters = {}
+
+    entities = []
+    for name, data in counters.items():
+        if scope == "pon" and not name.startswith("gpon_"):
+            continue
+        if scope == "uplink" and not (name.startswith("gei_") or name.startswith("xgei_")):
+            continue
+        series = grouped.get(name, [])
+        latest_rx = series[-1]["rx_bps"] if series else None
+        latest_tx = series[-1]["tx_bps"] if series else None
+        entities.append({
+            "name": name,
+            "ifindex": data.get("ifindex"),
+            "series": series,
+            "latest_rx_bps": latest_rx,
+            "latest_tx_bps": latest_tx,
+        })
+
+    # Sort: PON numerik, Uplink by name
+    def _sort_key(e):
+        n = e["name"]
+        if n.startswith("gpon_"):
+            # gpon_1/1/1 → (1, 1, 1)
+            parts = n.replace("gpon_", "").split("/")
+            return tuple(int(x) for x in parts if x.isdigit())
+        return n
+
+    entities.sort(key=_sort_key)
+
+    return {
+        "ok": True,
+        "scope": scope,
+        "minutes": minutes,
+        "total": len(entities),
+        "entities": entities,
+    }
+
+
 @router.delete("/{olt_id}")
 def delete_olt(db: Session = Depends(get_db),
                olt: OLT = Depends(require_olt_access),

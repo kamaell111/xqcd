@@ -1979,3 +1979,93 @@ html[data-theme="light"] .olt-switcher-wrap {
 
 
 table.table-cross-olt th:nth-child(1),
+
+/* ============================================================
+   Traffic page — grid card per entity (PON/Uplink)
+   ============================================================ */
+.traffic-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 16px;
+}
+@media (max-width: 800px) {
+  .traffic-grid { grid-template-columns: 1fr; }
+}
+
+.traffic-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 16px 18px;
+  transition: border-color var(--fast), box-shadow var(--fast);
+}
+.traffic-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-card);
+}
+
+.traffic-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-hair);
+}
+.traffic-card-title {
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+.traffic-card-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.traffic-card-badge.active {
+  background: var(--green-soft);
+  color: var(--green);
+  border: 1px solid var(--green-ring);
+}
+.traffic-card-badge.idle {
+  background: var(--surface-2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+.traffic-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.traffic-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.traffic-stat-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.traffic-stat-value {
+  font-size: 15px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+.traffic-stat-value.rx { color: #fb5468; }
+.traffic-stat-value.tx { color: #4c7dff; }
+
+.traffic-chart-wrap {
+  position: relative;
+  height: 140px;
+  margin-top: 8px;
+}

@@ -367,6 +367,7 @@ function loadPage(page) {
   if (page === "pons") loadPONDetail(opts);
   if (page === "onus") loadONUs(opts);
   if (page === "optical") loadOpticalPage(opts);
+  if (page === "traffic") loadTrafficPage(opts);
   if (page === "onu-detail") loadONUDetailPage(opts);
   if (page === "interfaces") loadInterfaces(opts);
   if (page === "vlans") loadVLANs(opts);
@@ -631,7 +632,7 @@ async function loadOpticalPage(opts = {}) {
     }
 
     el.innerHTML = `
-      <div class="table-wrap"><table class="table-premium${isCrossOlt ? " table-cross-olt" : ""}">
+      <div class="table-wrap"><table class="table-premium">
         <thead><tr>
           <th>#</th><th>Nama</th><th>Serial</th><th>PON</th>
           <th>RX (dBm)</th><th>TX (dBm)</th><th>Distance</th><th>Status</th><th>Kategori</th>
@@ -1424,6 +1425,144 @@ function renderInternetStatus(o) {
   return `<span class="status-badge ${cls}" title="${title}"><i class="fas ${icon}"></i> ${label}</span>`;
 }
 
+// =================== TRAFFIC PAGE ===================
+async function loadTrafficPage(opts = {}) {
+  const el = document.getElementById("traffic-grid");
+  if (!el) return;
+
+  // Destroy chart lama
+  _trafficCharts.forEach(c => { try { c.destroy(); } catch(_) {} });
+  _trafficCharts = [];
+
+  el.innerHTML = '<div style="text-align:center;padding:40px"><i class="fas fa-spinner fa-spin"></i> Memuat traffic...</div>';
+
+  const scope = document.getElementById("traffic-scope")?.value || "pon";
+  const minutes = document.getElementById("traffic-period")?.value || "240";
+
+  try {
+    const r = await api(`/olts/${CURRENT_OLT_ID}/traffic/recent?scope=${scope}&minutes=${minutes}`, opts);
+    if (!r.entities || !r.entities.length) {
+      el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-dim)">Tidak ada data traffic</div>';
+      return;
+    }
+
+    el.innerHTML = '<div class="traffic-grid">' + r.entities.map(e => {
+      const active = (e.latest_rx_bps || 0) > 0 || (e.latest_tx_bps || 0) > 0;
+      const badge = active
+        ? '<span class="traffic-card-badge active">active</span>'
+        : '<span class="traffic-card-badge idle">idle</span>';
+      const rx = e.latest_rx_bps ? _fmtBps(e.latest_rx_bps) : "-";
+      const tx = e.latest_tx_bps ? _fmtBps(e.latest_tx_bps) : "-";
+      return `
+        <div class="traffic-card">
+          <div class="traffic-card-head">
+            <span class="traffic-card-title">${escapeHtml(e.name)}</span>
+            ${badge}
+          </div>
+          <div class="traffic-stats">
+            <div class="traffic-stat">
+              <span class="traffic-stat-label">Download</span>
+              <span class="traffic-stat-value rx">${rx}</span>
+            </div>
+            <div class="traffic-stat">
+              <span class="traffic-stat-label">Upload</span>
+              <span class="traffic-stat-value tx">${tx}</span>
+            </div>
+          </div>
+          <div class="traffic-chart-wrap">
+            <canvas id="chart-traffic-${e.ifindex || e.name.replace(/[^a-z0-9]/gi, "_")}"></canvas>
+          </div>
+        </div>
+      `;
+    }).join("") + "</div>";
+
+    // Render charts
+    setTimeout(() => {
+      r.entities.forEach(e => {
+        const cid = "chart-traffic-" + (e.ifindex || e.name.replace(/[^a-z0-9]/gi, "_"));
+        const canvas = document.getElementById(cid);
+        if (!canvas) return;
+
+        const labels = e.series.map(p => new Date(p.ts).toLocaleTimeString("id-ID", {hour:"2-digit", minute:"2-digit"}));
+        const rxData = e.series.map(p => p.rx_bps ? p.rx_bps / 1e6 : 0);   // Mbps
+        const txData = e.series.map(p => p.tx_bps ? p.tx_bps / 1e6 : 0);
+
+        const chart = new Chart(canvas, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [
+              {
+                label: "Download",
+                data: rxData,
+                borderColor: "#fb5468",
+                backgroundColor: "rgba(251,84,104,0.08)",
+                borderWidth: 2,
+                fill: true,
+                tension: 0.35,
+                pointRadius: 0,
+                pointHoverRadius: 3,
+              },
+              {
+                label: "Upload",
+                data: txData,
+                borderColor: "#4c7dff",
+                backgroundColor: "rgba(76,125,255,0.08)",
+                borderWidth: 2,
+                fill: true,
+                tension: 0.35,
+                pointRadius: 0,
+                pointHoverRadius: 3,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3) + " Mbps",
+                },
+              },
+            },
+            scales: {
+              x: {
+                ticks: { color: "#8896b3", maxTicksLimit: 5, font: { size: 9 } },
+                grid: { display: false },
+                border: { display: false },
+              },
+              y: {
+                beginAtZero: true,
+                ticks: { color: "#8896b3", font: { size: 9 }, maxTicksLimit: 4 },
+                grid: { color: "rgba(42,53,80,0.4)" },
+                border: { display: false },
+              },
+            },
+          },
+        });
+        _trafficCharts.push(chart);
+      });
+    }, 30);
+
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--red)">Gagal: ' + escapeHtml(e.message) + '</div>';
+    }
+  }
+}
+
+function _fmtBps(bps) {
+  if (bps == null) return "-";
+  if (bps >= 1e9) return (bps/1e9).toFixed(2) + " Gbps";
+  if (bps >= 1e6) return (bps/1e6).toFixed(2) + " Mbps";
+  if (bps >= 1e3) return (bps/1e3).toFixed(1) + " Kbps";
+  return bps.toFixed(0) + " bps";
+}
+
 async function loadONUs(opts = {}) {
   const el = document.getElementById("onu-table");
   if (!el) return;
@@ -1492,8 +1631,12 @@ async function loadONUs(opts = {}) {
 
 document.getElementById("onu-search")?.addEventListener("input", debounce(loadONUs, 300));
 document.getElementById("onu-status-filter")?.addEventListener("change", loadONUs);
+document.getElementById("traffic-scope")?.addEventListener("change", loadTrafficPage);
+document.getElementById("traffic-period")?.addEventListener("change", loadTrafficPage);
+document.getElementById("btn-traffic-refresh")?.addEventListener("click", loadTrafficPage);
 
 let CURRENT_ONU_ID = null;
+let _trafficCharts = [];   // Chart.js instances (untuk destroy saat pindah)
 let CURRENT_ONU_OLT_ID = null;   // OLT tempat ONU yang sedang dibuka
 
 async function showONUDetail(onuId, oltId = null) {
