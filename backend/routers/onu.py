@@ -503,6 +503,13 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
         db.refresh(onu)
         audit(db, username, "provision_onu", req.serial_number)
 
+        # ⚡ Cache invalidate — ONU baru/provision berubah config
+        try:
+            from routers.sync import invalidate_olt_cache
+            invalidate_olt_cache(req.olt_id)
+        except Exception:
+            pass
+
         olt_manager.finish_job(job_id, "success", result={
             "onu_id": onu.id,
             "onu_index": onu_index,
@@ -701,6 +708,12 @@ def _run_delete_job(job_id: str, olt_id: int, onu_id: int, username: str):
     try:
         result = _do_delete_onu(olt_id, onu_id, db, username, job_id=job_id)
         olt_manager.finish_job(job_id, "success", result=result)
+        # ⚡ Cache invalidate — config berubah
+        try:
+            from routers.sync import invalidate_olt_cache
+            invalidate_olt_cache(olt_id)
+        except Exception:
+            pass
     except Exception as e:
         import traceback
         traceback.print_exc()

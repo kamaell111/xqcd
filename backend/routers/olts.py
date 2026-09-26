@@ -187,6 +187,12 @@ def commit_config(db: Session = Depends(get_db),
             raise HTTPException(500, f"Gagal commit: {e}")
 
         olt_manager.mark_committed(str(olt.id))
+        # ⚡ Cache invalidate — config berubah, cache running-config harus expired
+        try:
+            from routers.sync import invalidate_olt_cache
+            invalidate_olt_cache(olt.id)
+        except Exception as e:
+            print(f"[CACHE] gagal invalidate: {e}")
         audit(db, user.username, "commit_config", str(olt.id))
         return {
             "ok": True,

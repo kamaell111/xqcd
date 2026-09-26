@@ -286,6 +286,12 @@ def _run_create_vlan_job(job_id: str, olt_id: int, req_dict: dict, username: str
     try:
         result = _do_create_vlan(olt_id, req_dict, db, username, job_id=job_id)
         olt_manager.finish_job(job_id, "success", result=result)
+        # ⚡ Cache invalidate — config berubah
+        try:
+            from routers.sync import invalidate_olt_cache
+            invalidate_olt_cache(olt_id)
+        except Exception:
+            pass
     except Exception as e:
         import traceback; traceback.print_exc()
         olt_manager.finish_job(job_id, "failed", error=str(e)[:300])
@@ -490,6 +496,12 @@ def _run_delete_vlan_job(job_id: str, olt_id: int, vlan_id: int, force: bool, us
     try:
         result = _do_delete_vlan(olt_id, vlan_id, force, db, username, job_id=job_id)
         olt_manager.finish_job(job_id, "success", result=result)
+        # ⚡ Cache invalidate — config berubah
+        try:
+            from routers.sync import invalidate_olt_cache
+            invalidate_olt_cache(olt_id)
+        except Exception:
+            pass
     except Exception as e:
         import traceback; traceback.print_exc()
         olt_manager.finish_job(job_id, "failed", error=str(e)[:300])

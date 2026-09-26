@@ -14,6 +14,47 @@ from tenancy import require_olt_access
 from olt_client import LAST_READ_SHORT, LAST_READ_LONG
 from alerting import check_olt_resource_alerts, check_onu_alerts
 
+
+# =================== CACHE ===================
+import time as _time_mod
+import threading as _threading
+
+_RUNNING_CFG_CACHE = {}    # {olt_id: (raw, ts)}
+_ONU_STATE_CACHE = {}      # {olt_id: (raw, ts)}
+_UNCFG_CACHE = {}          # {olt_id: (raw, ts)}
+_CACHE_LOCK = _threading.Lock()
+
+_CACHE_TTL_RUNNING = 300   # 5 menit
+_CACHE_TTL_STATE = 30      # 30 detik
+_CACHE_TTL_UNCFG = 30      # 30 detik
+
+
+def invalidate_olt_cache(olt_id: int):
+    """Hapus semua cache untuk OLT tertentu. Dipanggil setelah write OLT."""
+    with _CACHE_LOCK:
+        _RUNNING_CFG_CACHE.pop(olt_id, None)
+        _ONU_STATE_CACHE.pop(olt_id, None)
+        _UNCFG_CACHE.pop(olt_id, None)
+    print(f"[CACHE] invalidate olt_id={olt_id}")
+
+
+def _cache_get(cache: dict, olt_id: int, ttl: int):
+    """Return value kalau masih fresh, None kalau expired."""
+    with _CACHE_LOCK:
+        entry = cache.get(olt_id)
+    if not entry:
+        return None
+    raw, ts = entry
+    if _time_mod.time() - ts > ttl:
+        return None
+    return raw
+
+
+def _cache_set(cache: dict, olt_id: int, raw: str):
+    with _CACHE_LOCK:
+        cache[olt_id] = (raw, _time_mod.time())
+
+
 router = APIRouter(prefix="/api/v1/olts", tags=["sync"])
 
 
@@ -450,13 +491,33 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
     try:
         conn = client._connect()
         try:
-            # 3 command dasar
-            running_cfg = conn.send_command_timing(
-                "show running-config", read_timeout=60, last_read=LAST_READ_LONG)
-            onu_state_out = conn.send_command_timing(
-                "show gpon onu state", read_timeout=30, last_read=LAST_READ_SHORT)
-            uncfg_out = conn.send_command_timing(
-                "show gpon onu uncfg", read_timeout=30, last_read=LAST_READ_SHORT)
+            # 3 command dasar — cache-aware
+            running_cfg = _cache_get(_RUNNING_CFG_CACHE, olt_id, _CACHE_TTL_RUNNING)
+            if running_cfg:
+                print(f"[CACHE] running-config HIT (olt_id={olt_id})")
+            else:
+                running_cfg = conn.send_command_timing(
+                    "show running-config", read_timeout=60, last_read=LAST_READ_LONG)
+                _cache_set(_RUNNING_CFG_CACHE, olt_id, running_cfg)
+                print(f"[CACHE] running-config MISS — cached")
+
+            onu_state_out = _cache_get(_ONU_STATE_CACHE, olt_id, _CACHE_TTL_STATE)
+            if onu_state_out:
+                print(f"[CACHE] onu-state HIT (olt_id={olt_id})")
+            else:
+                onu_state_out = conn.send_command_timing(
+                    "show gpon onu state", read_timeout=30, last_read=LAST_READ_SHORT)
+                _cache_set(_ONU_STATE_CACHE, olt_id, onu_state_out)
+                print(f"[CACHE] onu-state MISS — cached")
+
+            uncfg_out = _cache_get(_UNCFG_CACHE, olt_id, _CACHE_TTL_UNCFG)
+            if uncfg_out:
+                print(f"[CACHE] uncfg HIT (olt_id={olt_id})")
+            else:
+                uncfg_out = conn.send_command_timing(
+                    "show gpon onu uncfg", read_timeout=30, last_read=LAST_READ_SHORT)
+                _cache_set(_UNCFG_CACHE, olt_id, uncfg_out)
+                print(f"[CACHE] uncfg MISS — cached")
 
             # Ambil optical + pppoe status untuk setiap ONU
             import re as _re2
@@ -484,6 +545,14 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
 
             # ⚡ Pre-parse state untuk tahu mana ONU online (skip PPPoE kalau offline)
             _onu_state_pre = _parse_onu_state(onu_state_out)
+
+            # ⚡ Pre-fetch ONU rows dari DB untuk cek cache PPPoE
+            from models import ONU as _ONU
+            _onu_cache = {}
+            for _o in db.query(_ONU).filter(_ONU.olt_id == olt_id).all():
+                _key = f"{_o.pon_port}:{_o.onu_id}"
+                _onu_cache[_key] = _o
+            _pppoe_ttl = 300   # detik — cache PPPoE (test: 300s)
             online_idxs = set()
             for _o in _onu_state_pre:
                 if (_o.get("phase_state") or "").lower().strip() == "working":
@@ -513,15 +582,43 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                         "nat": None,
                     }
                 else:
-                    try:
-                        pppoe_cmd = f"show gpon remote-onu pppoe gpon-onu_{idx}"
-                        pppoe_out = conn.send_command_timing(pppoe_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
-                        if "Error" not in pppoe_out and "Invalid" not in pppoe_out:
-                            pppoe_map[idx] = _parse_remote_pppoe(pppoe_out)
-                        else:
-                            print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
-                    except Exception as e:
-                        print(f"[PPPOE] {idx} error: {e}")
+                    # ⚡ Cache check — kalau < 60 detik lalu, pakai DB
+                    cached = _onu_cache.get(idx)
+                    now_utc = datetime.utcnow()
+                    use_cache = (
+                        cached is not None
+                        and cached.internet_checked_at is not None
+                        and (now_utc - cached.internet_checked_at).total_seconds() < _pppoe_ttl
+                        and cached.pppoe_status
+                        and cached.pppoe_status != "unknown"
+                    )
+
+                    if use_cache:
+                        age = (now_utc - cached.internet_checked_at).total_seconds()
+                        print(f"[PPPOE-CACHE] {idx} HIT (age={age:.0f}s)")
+                        pppoe_map[idx] = {
+                            "status": cached.pppoe_status,
+                            "online_duration": cached.pppoe_online_duration or 0,
+                            "username": cached.pppoe_user,
+                            "nat": "enable" if cached.pppoe_nat else None,
+                            "_from_cache": True,
+                        }
+                    else:
+                        _age = None
+                        if cached and cached.internet_checked_at:
+                            _age = (now_utc - cached.internet_checked_at).total_seconds()
+                        print(f"[PPPOE-CACHE] {idx} MISS (age={_age}, status={cached.pppoe_status if cached else 'no-row'})")
+                        try:
+                            pppoe_cmd = f"show gpon remote-onu pppoe gpon-onu_{idx}"
+                            pppoe_out = conn.send_command_timing(pppoe_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
+                            if "Error" not in pppoe_out and "Invalid" not in pppoe_out:
+                                entry = _parse_remote_pppoe(pppoe_out)
+                                entry["_from_cache"] = False
+                                pppoe_map[idx] = entry
+                            else:
+                                print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
+                        except Exception as e:
+                            print(f"[PPPOE] {idx} error: {e}")
                 # Detail: distance — SNMP dulu, fallback Telnet
                 if so is not None and so.distance_m is not None:
                     detail_map[idx] = {"distance": so.distance_m, "online_duration": None}
@@ -680,18 +777,20 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
         if det and det["distance"] is not None:
             onu.distance = det["distance"]
 
-        # Simpan status PPPoE / internet (prioritas: remote-onu pppoe — realtime)
+        # Simpan status PPPoE / internet
         pppoe = pppoe_map.get(o["onu_index"])
         if pppoe:
             onu.pppoe_status = pppoe["status"]
             onu.pppoe_online_duration = pppoe["online_duration"]
-            if pppoe["username"]:
+            if pppoe.get("username"):
                 onu.pppoe_user = pppoe["username"]
-            if pppoe["nat"] == "enable":
+            if pppoe.get("nat") == "enable":
                 onu.pppoe_nat = True
+            # ⚡ Update internet_checked_at hanya kalau bukan dari cache
+            if not pppoe.get("_from_cache"):
+                onu.internet_checked_at = datetime.utcnow()
         else:
             onu.pppoe_status = "unknown"
-        onu.internet_checked_at = datetime.utcnow()
 
         # 🔔 AUTO-ALERT per-ONU (offline, pppoe down, optical low)
         try:
