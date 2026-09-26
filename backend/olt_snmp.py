@@ -29,6 +29,9 @@ except ImportError:
 ZTE_GPON = "1.3.6.1.4.1.3902.1012"
 
 # Standar
+OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"          # ifName
+OID_IF_HC_IN = "1.3.6.1.2.1.31.1.1.1.6"         # ifHCInOctets (Counter64)
+OID_IF_HC_OUT = "1.3.6.1.2.1.31.1.1.1.10"       # ifHCOutOctets (Counter64)
 OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0"
 OID_SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
 
@@ -202,6 +205,47 @@ class OltSnmpClient:
         except Exception as e:
             print(f"[SNMP-WALK] {base_oid} error: {e}")
         return results
+
+    async def get_port_counters(self) -> dict:
+        """Walk IF-MIB: ifName + ifHCInOctets + ifHCOutOctets.
+
+        Return: {ifname: {"ifindex": int, "rx_octets": int, "tx_octets": int}}
+        """
+        names = await self.walk(OID_IF_NAME)
+        if not names:
+            return {}
+
+        # Map ifindex -> ifname
+        idx_to_name = {}
+        for oid_str, val in names:
+            tail = _parse_index(oid_str[len(OID_IF_NAME):])
+            if tail:
+                idx_to_name[tail[0]] = str(val)
+
+        result = {}
+        for name in idx_to_name.values():
+            result[name] = {"ifindex": None, "rx_octets": None, "tx_octets": None}
+
+        # Walk RX
+        rx_rows = await self.walk(OID_IF_HC_IN)
+        for oid_str, val in rx_rows:
+            tail = _parse_index(oid_str[len(OID_IF_HC_IN):])
+            if tail and tail[0] in idx_to_name:
+                name = idx_to_name[tail[0]]
+                result[name]["ifindex"] = tail[0]
+                result[name]["rx_octets"] = int(val)
+
+        # Walk TX
+        tx_rows = await self.walk(OID_IF_HC_OUT)
+        for oid_str, val in tx_rows:
+            tail = _parse_index(oid_str[len(OID_IF_HC_OUT):])
+            if tail and tail[0] in idx_to_name:
+                name = idx_to_name[tail[0]]
+                if result[name]["ifindex"] is None:
+                    result[name]["ifindex"] = tail[0]
+                result[name]["tx_octets"] = int(val)
+
+        return result
 
     async def test_connection(self) -> dict:
         """Test koneksi SNMP — ambil sysDescr."""

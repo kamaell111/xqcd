@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, Float,
+    Column, Integer, BigInteger, String, Boolean, DateTime, Float,
     ForeignKey, Text, JSON, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
@@ -228,3 +228,25 @@ class MetricHistory(Base):
     metric = Column(String(16), nullable=False, index=True)   # "cpu" | "memory"
     value = Column(Float, nullable=False)
     ts = Column(DateTime, default=datetime.utcnow, index=True)
+
+class TrafficSample(Base):
+    """Sample traffic per interface (PON, Uplink, ONU).
+
+    rate disimpan hasil hitung (bps) supaya query chart cepat.
+    raw_octets disimpan untuk hitung delta poll berikutnya.
+    """
+    __tablename__ = "traffic_sample"
+    id = Column(Integer, primary_key=True)
+    olt_id = Column(Integer, ForeignKey("olts.id"), nullable=False, index=True)
+    scope = Column(String(16), nullable=False)          # 'pon' | 'uplink' | 'onu'
+    entity_key = Column(String(64), nullable=False)     # 'gpon_1/1/1', 'gei_1/3/3', 'gpon-onu_1/1/1:1'
+    rx_bps = Column(Float, nullable=True)               # rate hitung
+    tx_bps = Column(Float, nullable=True)
+    raw_rx_octets = Column(BigInteger, nullable=True)   # counter raw saat sample
+    raw_tx_octets = Column(BigInteger, nullable=True)
+    ts = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        # Index untuk query chart
+        __import__("sqlalchemy").Index("idx_traffic_chart", "olt_id", "scope", "entity_key", "ts"),
+    )

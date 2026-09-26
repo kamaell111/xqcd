@@ -284,6 +284,44 @@ def update_olt(req: OLTUpdate,
     return olt
 
 
+@router.post("/{olt_id}/traffic/poll")
+async def poll_traffic(olt: OLT = Depends(require_olt_access),
+                       user: User = Depends(get_current_user)):
+    """Walk IF-MIB counters — PON + Uplink. Return JSON untuk verifikasi."""
+    from olt_snmp import OltSnmpClient
+    import time as _t
+
+    community = olt.snmp_community_ro or "public"
+    port = olt.snmp_port or 161
+
+    client = OltSnmpClient(olt.ip_address, community, port=port)
+    t0 = _t.time()
+    try:
+        counters = await client.get_port_counters()
+        elapsed = round(_t.time() - t0, 2)
+
+        pon = {}
+        uplink = {}
+        for name, data in counters.items():
+            if name.startswith("gpon_"):
+                pon[name] = data
+            elif name.startswith("gei_") or name.startswith("xgei_"):
+                uplink[name] = data
+
+        return {
+            "ok": True,
+            "elapsed_seconds": elapsed,
+            "total": len(counters),
+            "pon_count": len(pon),
+            "uplink_count": len(uplink),
+            "pon": pon,
+            "uplink": uplink,
+            "ts": _t.time(),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @router.delete("/{olt_id}")
 def delete_olt(db: Session = Depends(get_db),
                olt: OLT = Depends(require_olt_access),
