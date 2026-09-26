@@ -11,4 +11,4 @@ paramiko>=4.0.0
 netmiko>=4.5.0
 apscheduler>=3.11.0
 httpx>=0.28.0
-aiofiles>=24.1.0
+aiofiles>=24.1.0pysnmp>=7.1.0
