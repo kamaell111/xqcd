@@ -1953,9 +1953,6 @@ html[data-theme="light"] .olt-switcher-wrap {
 }
 
 /* Cross-OLT view: chip nama OLT di kolom */
-.olt-chip i {
-  font-size: 9px;
-}
 
 /* Hidden helper */
 .hidden {
@@ -1980,25 +1977,5 @@ html[data-theme="light"] .olt-switcher-wrap {
 
 
 
-/* ============================================================
-   Kolom OLT — pakai table-layout: fixed + colgroup
-   ============================================================ */
-table.table-cross-olt {
-  table-layout: fixed;
-  width: 100%;
-}
-table.table-cross-olt th,
-table.table-cross-olt td {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+
 table.table-cross-olt th:nth-child(1),
-table.table-cross-olt td:nth-child(1) {
-  background: var(--surface-2);
-  border-right: 1px solid var(--border);
-  color: var(--accent);
-  font-weight: 600;
-  padding-left: 14px;
-  padding-right: 10px;
-}

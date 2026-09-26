@@ -119,7 +119,6 @@ function resetAppState() {
   _inventoryCache = null;
   _oltDriversCache = null;
   window._oltOwnersCache = null;
-  window._oltFilterLoaded = false;
   // Chart — destroy biar tidak nyangkut
   if (cpuChart) {
     try { cpuChart.destroy(); } catch(_) {}
@@ -1425,48 +1424,15 @@ function renderInternetStatus(o) {
   return `<span class="status-badge ${cls}" title="${title}"><i class="fas ${icon}"></i> ${label}</span>`;
 }
 
-// =================== OLT FILTER (Super Admin) ===================
-async function loadOltFilter() {
-  const el = document.getElementById("onu-olt-filter");
-  if (!el) return;
-  // Hanya tampil untuk Super Admin
-  if (!CURRENT_USER || !CURRENT_USER.is_super_admin) {
-    el.classList.add("hidden");
-    return;
-  }
-  try {
-    const olts = await api("/olts");
-    if (olts.length < 1) {
-      el.classList.add("hidden");
-      return;
-    }
-    el.classList.remove("hidden");
-    el.innerHTML = '<option value="all">Semua OLT (' + olts.length + ')</option>' +
-      olts.map(o => '<option value="' + o.id + '">' + escapeHtml(o.hostname) + '</option>').join("");
-  } catch (_) {}
-}
-
 async function loadONUs(opts = {}) {
   const el = document.getElementById("onu-table");
   if (!el) return;
   try {
-    // Lazy-load OLT filter (sekali saja per page-load)
-    if (!window._oltFilterLoaded) {
-      await loadOltFilter();
-      window._oltFilterLoaded = true;
-    }
     const search = document.getElementById("onu-search").value.toLowerCase().trim();
     const status = document.getElementById("onu-status-filter").value;
-    const oltFilterEl = document.getElementById("onu-olt-filter");
-    const oltFilter = oltFilterEl && !oltFilterEl.classList.contains("hidden") ? oltFilterEl.value : null;
-
-    // Selalu pakai global /onus biar olt_hostname selalu ada
-    const isCrossOlt = true;
-    const params = new URLSearchParams();
-    if (status) params.set("status", status);
-    if (oltFilter && oltFilter !== "all") params.set("olt_id", oltFilter);
-    const qs = params.toString();
-    const onus = await api("/onus" + (qs ? "?" + qs : ""), opts);
+    let url = `/olts/${CURRENT_OLT_ID}/onus`;
+    if (status) url += `?status=${status}`;
+    const onus = await api(url, opts);
 
     const filtered = onus.filter(o => {
       if (!search) return true;
@@ -1486,31 +1452,15 @@ async function loadONUs(opts = {}) {
     }
 
     el.innerHTML = `
-      <div class="table-wrap"><table class="table-premium${isCrossOlt ? " table-cross-olt" : ""}">
-        ${isCrossOlt ? `<colgroup>
-          <col style="width:100px">
-          <col style="width:180px">
-          <col style="width:160px">
-          <col style="width:140px">
-          <col style="width:80px">
-          <col style="width:80px">
-          <col style="width:180px">
-          <col style="width:100px">
-          <col style="width:90px">
-          <col style="width:100px">
-          <col style="width:110px">
-          <col style="width:100px">
-        </colgroup>` : ''}
+      <div class="table-wrap"><table class="table-premium">
         <thead><tr>
-          ${isCrossOlt ? '<th>OLT</th>' : ''}
           <th>Interface</th><th>Serial Number</th><th>Nama</th><th>Merek</th><th>ONU</th>
           <th>Internet</th><th>RX (dBm)</th><th>Distance</th><th>VLAN</th><th>PPPoE</th><th>Aksi</th>
         </tr></thead>
         <tbody>
           ${filtered.map(o => `
             <tr>
-              ${isCrossOlt ? `<td>${escapeHtml(o.olt_hostname || "?")}</td>` : ''}
-              <td><b>${escapeHtml(o.interface_name || `${o.pon_port}:${o.onu_id}`)}</b></td>
+<td><b>${escapeHtml(o.interface_name || `${o.pon_port}:${o.onu_id}`)}</b></td>
               <td><code>${escapeHtml(o.serial_number || "-")}</code></td>
               <td>${escapeHtml(o.name || "-")}</td>
               <td>${renderVendorBadge(o)}</td>
@@ -1542,7 +1492,6 @@ async function loadONUs(opts = {}) {
 
 document.getElementById("onu-search")?.addEventListener("input", debounce(loadONUs, 300));
 document.getElementById("onu-status-filter")?.addEventListener("change", loadONUs);
-document.getElementById("onu-olt-filter")?.addEventListener("change", loadONUs);
 
 let CURRENT_ONU_ID = null;
 let CURRENT_ONU_OLT_ID = null;   // OLT tempat ONU yang sedang dibuka
