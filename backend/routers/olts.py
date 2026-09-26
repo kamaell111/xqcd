@@ -291,103 +291,15 @@ async def poll_traffic(olt: OLT = Depends(require_olt_access),
                        user: User = Depends(get_current_user)):
     """Poll IF-MIB counters → hitung rate → simpan ke DB.
 
-    Return JSON dengan rate_rx_bps + rate_tx_bps (kalau ada baseline).
-    Sample pertama per entity hanya simpan raw (rate=null).
+    Thin wrapper di atas traffic_poller.poll_traffic_for_olt().
     """
-    from olt_snmp import OltSnmpClient
-    from models import TrafficSample
-    import time as _t
-
-    community = olt.snmp_community_ro or "public"
-    port = olt.snmp_port or 161
-
-    client = OltSnmpClient(olt.ip_address, community, port=port)
-    t0 = _t.time()
+    from traffic_poller import poll_traffic_for_olt
     try:
-        counters = await client.get_port_counters()
-        elapsed = round(_t.time() - t0, 2)
-
-        now_dt = datetime.utcnow()
-        now_ts = _t.time()
-        saved = 0
-
-        pon = {}
-        uplink = {}
-
-        for name, data in counters.items():
-            # Tentukan scope
-            if name.startswith("gpon_"):
-                scope = "pon"
-            elif name.startswith("gei_") or name.startswith("xgei_"):
-                scope = "uplink"
-            else:
-                continue
-
-            rx_now = data.get("rx_octets")
-            tx_now = data.get("tx_octets")
-
-            # Cari sample terakhir untuk entity ini
-            prev = (db.query(TrafficSample)
-                    .filter(TrafficSample.olt_id == olt.id,
-                            TrafficSample.scope == scope,
-                            TrafficSample.entity_key == name)
-                    .order_by(TrafficSample.ts.desc())
-                    .first())
-
-            rx_bps = None
-            tx_bps = None
-
-            if prev and prev.ts and prev.raw_rx_octets is not None and prev.raw_tx_octets is not None:
-                dt_sec = (now_dt - prev.ts).total_seconds()
-                if dt_sec > 0.5 and rx_now is not None and tx_now is not None:
-                    # Handle counter reset: kalau counter turun → skip rate
-                    if rx_now >= prev.raw_rx_octets:
-                        rx_bps = (rx_now - prev.raw_rx_octets) * 8.0 / dt_sec
-                    if tx_now >= prev.raw_tx_octets:
-                        tx_bps = (tx_now - prev.raw_tx_octets) * 8.0 / dt_sec
-
-            # Simpan sample baru
-            sample = TrafficSample(
-                olt_id=olt.id,
-                scope=scope,
-                entity_key=name,
-                rx_bps=rx_bps,
-                tx_bps=tx_bps,
-                raw_rx_octets=rx_now,
-                raw_tx_octets=tx_now,
-                ts=now_dt,
-            )
-            db.add(sample)
-            saved += 1
-
-            entry = {
-                "ifindex": data.get("ifindex"),
-                "rx_octets": rx_now,
-                "tx_octets": tx_now,
-                "rx_bps": rx_bps,
-                "tx_bps": tx_bps,
-            }
-            if scope == "pon":
-                pon[name] = entry
-            else:
-                uplink[name] = entry
-
-        db.commit()
-
-        return {
-            "ok": True,
-            "elapsed_seconds": elapsed,
-            "total": len(counters),
-            "pon_count": len(pon),
-            "uplink_count": len(uplink),
-            "saved": saved,
-            "pon": pon,
-            "uplink": uplink,
-            "ts": now_ts,
-        }
+        return await poll_traffic_for_olt(db, olt)
     except Exception as e:
         db.rollback()
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
 
 
 @router.delete("/{olt_id}")

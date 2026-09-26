@@ -405,11 +405,44 @@ async def _startup_full_sync():
         traceback.print_exc()
 
 
+async def _poll_traffic_job():
+    """Poll traffic semua OLT tiap 5 menit — simpan ke traffic_sample."""
+    from olt_manager import olt_manager
+    from traffic_poller import poll_traffic_for_olt
+
+    db = SessionLocal()
+    try:
+        olts = db.query(OLT).filter(OLT.enabled == 1).all()
+        for olt in olts:
+            reason = olt_manager.is_olt_circuit_open(str(olt.id))
+            if reason:
+                print(f"[TRAFFIC-POLL] OLT {olt.id} — {reason}, skip")
+                continue
+            lock = olt_manager.get_thread_lock(str(olt.id))
+            if not lock.acquire(blocking=False):
+                print(f"[TRAFFIC-POLL] OLT {olt.id} sibuk, skip")
+                continue
+            try:
+                result = await poll_traffic_for_olt(db, olt)
+                if result.get("ok"):
+                    print(f"[TRAFFIC-POLL] {olt.ip_address} OK · {result['saved']} sample")
+                else:
+                    print(f"[TRAFFIC-POLL] {olt.ip_address} gagal: {result.get('error')}")
+            except Exception as e:
+                print(f"[TRAFFIC-POLL] {olt.id} error: {type(e).__name__}: {e}")
+                db.rollback()
+            finally:
+                lock.release()
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     migrate_db()
     seed_data()
+
     scheduler.add_job(
         poll_olts, "interval",
         seconds=settings.SNMP_POLL_INTERVAL,
@@ -419,6 +452,14 @@ async def lifespan(app: FastAPI):
         misfire_grace_time=30,     # toleransi 30s kalau telat
     )
     # ⭐ Retention job: hapus data lama tiap 24 jam
+    scheduler.add_job(
+        _poll_traffic_job, "interval",
+        minutes=5,
+        id="poll_traffic",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
     scheduler.add_job(
         _retention_job, "interval",
         hours=24,
