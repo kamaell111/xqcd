@@ -1,3 +1,4 @@
+import asyncio
 """Sync data real dari OLT ZXAN → DB."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -457,17 +458,44 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
             uncfg_out = conn.send_command_timing(
                 "show gpon onu uncfg", read_timeout=30, last_read=LAST_READ_SHORT)
 
-            # Ambil optical + pppoe status untuk setiap ONU (1 koneksi, loop command)
+            # Ambil optical + pppoe status untuk setiap ONU
             import re as _re2
+
+            # ⚡ SNMP walk dulu (1-2 detik untuk 100+ ONU) — optical + distance
+            snmp_data = {}
+            if olt.snmp_community_ro:
+                try:
+                    from olt_snmp import OltSnmpClient
+                    async def _do_snmp():
+                        c = OltSnmpClient(olt.ip_address, olt.snmp_community_ro,
+                                          port=olt.snmp_port or 161)
+                        return await c.list_onus()
+                    loop = asyncio.new_event_loop()
+                    try:
+                        snmp_onus = loop.run_until_complete(_do_snmp())
+                    finally:
+                        loop.close()
+                    for so in snmp_onus:
+                        pon_num = 1 + (so.pon_idx - 268501248) // 256
+                        snmp_data[f"1/1/{pon_num}:{so.onu_id}"] = so
+                    print(f"[SNMP] {len(snmp_data)} ONU via SNMP")
+                except Exception as e:
+                    print(f"[SNMP] gagal: {e} — fallback Telnet untuk optical")
+
             for m in _re2.finditer(r"^\s*(\d+/\d+/\d+:\d+)\s+enable", onu_state_out, _re2.MULTILINE):
                 idx = m.group(1)
-                # Optical
-                try:
-                    att_cmd = f"show pon power attenuation gpon-onu_{idx}"
-                    att_out = conn.send_command_timing(att_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
-                    optical_map[idx] = _parse_attenuation(att_out)
-                except Exception as e:
-                    print(f"[OPTICAL] {idx} error: {e}")
+                so = snmp_data.get(idx)
+
+                # Optical: SNMP dulu, fallback Telnet
+                if so is not None and so.rx_dbm is not None:
+                    optical_map[idx] = {"onu_rx": so.rx_dbm, "onu_tx": so.tx_dbm}
+                else:
+                    try:
+                        att_cmd = f"show pon power attenuation gpon-onu_{idx}"
+                        att_out = conn.send_command_timing(att_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
+                        optical_map[idx] = _parse_attenuation(att_out)
+                    except Exception as e:
+                        print(f"[OPTICAL] {idx} error: {e}")
                 # PPPoE status (khusus ZTE, Huawei akan error — ok)
                 try:
                     pppoe_cmd = f"show gpon remote-onu pppoe gpon-onu_{idx}"
@@ -478,13 +506,16 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                         print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
                 except Exception as e:
                     print(f"[PPPOE] {idx} error: {e}")
-                # Detail: distance + online duration
-                try:
-                    det_cmd = f"show gpon onu detail-info gpon-onu_{idx}"
-                    det_out = conn.send_command_timing(det_cmd, read_timeout=30, last_read=LAST_READ_LONG)
-                    detail_map[idx] = _parse_onu_detail(det_out)
-                except Exception as e:
-                    print(f"[DETAIL] {idx} error: {e}")
+                # Detail: distance — SNMP dulu, fallback Telnet
+                if so is not None and so.distance_m is not None:
+                    detail_map[idx] = {"distance": so.distance_m, "online_duration": None}
+                else:
+                    try:
+                        det_cmd = f"show gpon onu detail-info gpon-onu_{idx}"
+                        det_out = conn.send_command_timing(det_cmd, read_timeout=30, last_read=LAST_READ_LONG)
+                        detail_map[idx] = _parse_onu_detail(det_out)
+                    except Exception as e:
+                        print(f"[DETAIL] {idx} error: {e}")
         finally:
             conn.disconnect()
     except Exception as e:
