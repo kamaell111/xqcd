@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     # true = alert "info" saat mendeteksi dying_gasp
     ALERT_DYING_GASP: bool = False
 
+    # =================== Cache TTL ===================
+    # Berapa lama data OLT di-cache sebelum di-query ulang via Telnet.
+    # Kecilkan = data lebih fresh, tapi beban OLT lebih besar.
+    # Perbesar = hemat beban, tapi data bisa stale.
+    PPPOE_CACHE_TTL_S: int = 60         # status PPPoE (connected/disconnected)
+    DETAIL_CACHE_TTL_S: int = 600       # detail ONU (SN, distance, online duration)
+    OPTICAL_CACHE_TTL_S: int = 120      # optical RX/TX per-PON
+
     # =================== Seed data ===================
     # User default aplikasi
     SEED_ADMIN_USERNAME: str = "admin"

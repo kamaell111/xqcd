@@ -1181,6 +1181,7 @@ code {
 .table-wrap{border:1px solid var(--rule);border-radius:12px;background:var(--surface);overflow:auto;max-height:calc(100vh - 300px)}
 .table-premium{width:100%;border-collapse:separate;border-spacing:0;border:0;border-radius:0;background:transparent;font-variant-numeric:tabular-nums}
 .table-premium thead th{position:sticky;top:0;z-index:3;background:linear-gradient(180deg,#171a21,#131620);border-bottom:1px solid var(--rule-2);padding:0 16px;height:42px;font-size:11px;font-weight:650;letter-spacing:.01em;text-transform:none;color:var(--text-dim);white-space:nowrap}
+.table-premium thead th:first-child{color:var(--text);font-weight:700;background:var(--surface-2)}
 .table-premium thead th::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:linear-gradient(90deg,transparent,rgba(76,125,255,.35),transparent);opacity:.7}
 .table-premium th.num,.table-premium td.num{text-align:right}
 .table-premium tbody td{height:var(--row-h);padding:0 16px;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px;color:var(--text-2);vertical-align:middle;white-space:nowrap}
@@ -1188,8 +1189,10 @@ code {
 .table-premium tbody tr:nth-child(even){background:rgba(255,255,255,.018)}
 .table-premium tbody tr{position:relative;transition:background 140ms var(--e),transform 140ms var(--e)}
 .table-premium tbody tr:hover{background:rgba(76,125,255,.055);transform:translateX(2px)}
-.table-premium tbody tr::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent);opacity:0;transition:opacity 140ms var(--e)}
-.table-premium tbody tr:hover::before{opacity:1}
+/* Hover indicator dipindah ke td:first-child (box-shadow inset) — tr::before
+   membuat sel anonim di kolom 1 dan menggeser seluruh body 1 kolom ke kanan. */
+.table-premium tbody td:first-child{box-shadow:inset 2px 0 0 transparent;transition:box-shadow 140ms var(--e)}
+.table-premium tbody tr:hover td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .table-premium tbody tr:last-child td{border-bottom:0}
 .table-premium tbody tr.row-new{animation:rowIn 240ms var(--e)}
 @keyframes rowIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
@@ -2066,6 +2069,6 @@ table.table-cross-olt th:nth-child(1),
 
 .traffic-chart-wrap {
   position: relative;
-  height: 140px;
-  margin-top: 8px;
+  height: 200px;
+  margin-top: 10px;
 }

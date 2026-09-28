@@ -14,12 +14,30 @@ _CONN_TTL = 240           # 4 menit
 
 
 class _CachedConn:
-    """Wrapper: disconnect() jadi no-op biar koneksi tetap hidup untuk request berikutnya."""
+    """Wrapper: disconnect() jadi no-op biar koneksi tetap hidup untuk request berikutnya.
+
+    _cmd_lock di-share via connection object (bukan per wrapper) supaya
+    semua _CachedConn yang wrap koneksi fisik yang sama pakai lock yang SAMA.
+    """
     def __init__(self, conn, key):
         self._conn = conn
         self._key = key
+        # Ambil / buat _cmd_lock di connection asli (shared antar wrapper)
+        if not hasattr(conn, "_olut_cmd_lock"):
+            conn._olut_cmd_lock = threading.Lock()
+        self._cmd_lock = conn._olut_cmd_lock
+
     def __getattr__(self, name):
         return getattr(self._conn, name)
+
+    def send_command_timing(self, *args, **kwargs):
+        with self._cmd_lock:
+            return self._conn.send_command_timing(*args, **kwargs)
+
+    def send_command(self, *args, **kwargs):
+        with self._cmd_lock:
+            return self._conn.send_command(*args, **kwargs)
+
     def disconnect(self):
         # Update timestamp saja, JANGAN tutup koneksi
         with _CONN_LOCK:

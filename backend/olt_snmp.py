@@ -369,8 +369,11 @@ class OltSnmpClient:
 if __name__ == "__main__":
     import sys
     import json
-    host = sys.argv[1] if len(sys.argv) > 1 else "136.1.1.200"
-    community = sys.argv[2] if len(sys.argv) > 2 else "bagoes_ro"
+    import os
+    host = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("OLT_HOST")
+    community = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("SNMP_COMMUNITY")
+    if not host or not community:
+        sys.exit("Usage: OLT_HOST=x.x.x.x SNMP_COMMUNITY=xxx python olt_snmp.py [host] [community]")
 
     async def main():
         client = OltSnmpClient(host, community)

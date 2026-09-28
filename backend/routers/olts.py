@@ -7,7 +7,7 @@ from models import OLT, User
 from schemas import OLTCreate, OLTOut, OLTUpdate, OLTTestRequest
 from auth import get_current_user, require_privilege, audit
 from tenancy import OwnerContext, get_owner_ctx, scoped_olts, get_olt_or_403, require_olt_access
-from olt_manager import olt_manager
+from olt_manager import olt_manager, olt_lock, olt_lock_async
 from drivers import list_drivers, is_valid as is_driver_valid
 
 router = APIRouter(prefix="/api/v1/olts", tags=["olts"])
@@ -67,28 +67,31 @@ def test_olt_connection(req: OLTTestRequest,
     """Tes koneksi Telnet ke OLT tanpa simpan ke DB."""
     from olt_client import OLTClient
     import re
-    try:
-        client = OLTClient(
-            host=req.ip_address,
-            username=req.username,
-            password=req.password,
-            enable_password=req.enable_password or "",
-            port=req.port,
-            protocol=req.protocol or "telnet",
-            fast_test=True,  # 1a-1: timeout cepat, retry 1x, jangan blok UI 90s
-        )
-        result = client.test_connection()
-        if result.get("ok") and result.get("output"):
-            out = result["output"]
-            m = re.search(r"System name:\s*(\S+)", out) or re.search(r"^\s*hostname\s+(\S+)", out, re.MULTILINE)
-            result["hostname"] = m.group(1) if m else ""
-            m = re.search(r"(ZXA10\s+)?C\d{3}", out)
-            result["model"] = m.group(0).strip() if m else ""
-            m = re.search(r"V\d+\.\d+\.\d+", out)
-            result["firmware"] = m.group(0) if m else ""
-        return result
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    olt_id = getattr(req, "olt_id", None)
+    lock_key = str(olt_id) if olt_id else f"{req.ip_address}:{req.port}"
+    with olt_lock(lock_key, timeout=5):
+        try:
+            client = OLTClient(
+                host=req.ip_address,
+                username=req.username,
+                password=req.password,
+                enable_password=req.enable_password or "",
+                port=req.port,
+                protocol=req.protocol or "telnet",
+                fast_test=True,  # 1a-1: timeout cepat, retry 1x, jangan blok UI 90s
+            )
+            result = client.test_connection()
+            if result.get("ok") and result.get("output"):
+                out = result["output"]
+                m = re.search(r"System name:\s*(\S+)", out) or re.search(r"^\s*hostname\s+(\S+)", out, re.MULTILINE)
+                result["hostname"] = m.group(1) if m else ""
+                m = re.search(r"(ZXA10\s+)?C\d{3}", out)
+                result["model"] = m.group(0).strip() if m else ""
+                m = re.search(r"V\d+\.\d+\.\d+", out)
+                result["firmware"] = m.group(0) if m else ""
+            return result
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 # =================== SNMP (Phase 2) ===================
@@ -286,24 +289,25 @@ def update_olt(req: OLTUpdate,
 
 
 @router.post("/{olt_id}/traffic/poll")
-async def poll_traffic(olt: OLT = Depends(require_olt_access),
-                       db: Session = Depends(get_db),
-                       user: User = Depends(get_current_user)):
-    """Poll IF-MIB counters → hitung rate → simpan ke DB.
+def poll_traffic(olt: OLT = Depends(require_olt_access),
+                 db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user)):
+    """Poll traffic via Telnet → hitung rate → simpan ke DB.
 
-    Thin wrapper di atas traffic_poller.poll_traffic_for_olt().
+    Sync def — FastAPI jalankan di threadpool. Pakai olt_lock (RLock).
     """
     from traffic_poller import poll_traffic_for_olt
-    try:
-        return await poll_traffic_for_olt(db, olt)
-    except Exception as e:
-        db.rollback()
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    with olt_lock(str(olt.id), timeout=5):
+        try:
+            return poll_traffic_for_olt(db, olt)
+        except Exception as e:
+            db.rollback()
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 
 @router.get("/{olt_id}/traffic/recent")
-async def get_traffic_recent(
+def get_traffic_recent(
     scope: str = "pon",           # 'pon' | 'uplink'
     minutes: int = 240,           # 4 jam default
     db: Session = Depends(get_db),
@@ -344,27 +348,24 @@ async def get_traffic_recent(
             "tx_bps": r.tx_bps,
         })
 
-    # Daftar entity lengkap dari IF-MIB (walk cepat via SNMP)
-    from olt_snmp import OltSnmpClient
-    client = OltSnmpClient(olt.ip_address, olt.snmp_community_ro or "public",
-                           port=olt.snmp_port or 161)
-    try:
-        counters = await client.get_port_counters()
-    except Exception:
-        counters = {}
-
+    # Daftar entity dari DB saja (tidak SNMP walk — hemat waktu & tidak butuh lock)
     entities = []
-    for name, data in counters.items():
-        if scope == "pon" and not name.startswith("gpon_"):
-            continue
-        if scope == "uplink" and not (name.startswith("gei_") or name.startswith("xgei_")):
-            continue
+
+    if scope == "pon":
+        entity_names = [f"gpon_1/1/{i}" for i in range(1, 17)]
+    else:  # uplink
+        from models import Interface
+        entity_names = [
+            iface.name for iface in
+            db.query(Interface).filter(Interface.olt_id == olt.id).all()
+        ]
+
+    for name in entity_names:
         series = grouped.get(name, [])
         latest_rx = series[-1]["rx_bps"] if series else None
         latest_tx = series[-1]["tx_bps"] if series else None
         entities.append({
             "name": name,
-            "ifindex": data.get("ifindex"),
             "series": series,
             "latest_rx_bps": latest_rx,
             "latest_tx_bps": latest_tx,
@@ -384,6 +385,82 @@ async def get_traffic_recent(
     return {
         "ok": True,
         "scope": scope,
+        "minutes": minutes,
+        "total": len(entities),
+        "entities": entities,
+    }
+
+
+@router.get("/{olt_id}/traffic/onu/recent")
+def get_traffic_onu_recent(
+    minutes: int = 240,
+    onu_key: str = None,        # optional: filter 1 ONU (misal 'gpon-onu_1/1/1:1')
+    db: Session = Depends(get_db),
+    olt: OLT = Depends(require_olt_access),
+    user: User = Depends(get_current_user),
+):
+    """Ambil traffic per-ONU dari DB (scope='onu').
+
+    Kalau onu_key diisi → return series hanya untuk 1 ONU itu.
+    Kalau tidak → return semua ONU yang punya sample.
+    """
+    from models import TrafficSample, ONU
+    from datetime import timedelta
+
+    since = datetime.utcnow() - timedelta(minutes=minutes)
+
+    q = (
+        db.query(TrafficSample)
+        .filter(
+            TrafficSample.olt_id == olt.id,
+            TrafficSample.scope == "onu",
+            TrafficSample.ts >= since,
+        )
+    )
+    if onu_key:
+        q = q.filter(TrafficSample.entity_key == onu_key)
+    rows = q.order_by(TrafficSample.ts.asc()).all()
+
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r.entity_key, []).append({
+            "ts": int(r.ts.timestamp() * 1000),
+            "rx_bps": r.rx_bps,
+            "tx_bps": r.tx_bps,
+        })
+
+    # Kalau filter 1 ONU → return langsung
+    if onu_key:
+        series = grouped.get(onu_key, [])
+        return {
+            "ok": True,
+            "onu_key": onu_key,
+            "minutes": minutes,
+            "series": series,
+            "latest_rx_bps": series[-1]["rx_bps"] if series else None,
+            "latest_tx_bps": series[-1]["tx_bps"] if series else None,
+        }
+
+    # Kalau tidak filter → daftar semua ONU (metadata + series)
+    onus = db.query(ONU).filter(ONU.olt_id == olt.id).order_by(ONU.pon_port, ONU.onu_id).all()
+    entities = []
+    for onu in onus:
+        key = onu.interface_name or f"gpon-onu_{onu.pon_port}:{onu.onu_id}"
+        series = grouped.get(key, [])
+        entities.append({
+            "name": key,
+            "onu_id": onu.id,
+            "serial_number": onu.serial_number,
+            "label": onu.name or onu.serial_number or key,
+            "status": onu.status,
+            "series": series,
+            "latest_rx_bps": series[-1]["rx_bps"] if series else None,
+            "latest_tx_bps": series[-1]["tx_bps"] if series else None,
+        })
+
+    return {
+        "ok": True,
+        "scope": "onu",
         "minutes": minutes,
         "total": len(entities),
         "entities": entities,

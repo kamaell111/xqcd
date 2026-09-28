@@ -24,7 +24,7 @@ class OLTManager:
         # Lock per OLT (asyncio.Lock, karena dipakai di async context)
         self.locks: Dict[str, asyncio.Lock] = {}
         # Thread lock per OLT (untuk endpoint sync yang jalan di threadpool)
-        self.thread_locks: Dict[str, threading.Lock] = {}
+        self.thread_locks: Dict[str, threading.RLock] = {}
         self.thread_locks_guard = threading.Lock()
         # Job store in-memory
         self.jobs: Dict[str, Dict[str, Any]] = {}
@@ -102,12 +102,12 @@ class OLTManager:
             self.locks[olt_id] = asyncio.Lock()
         return self.locks[olt_id]
 
-    def get_thread_lock(self, olt_id: str) -> threading.Lock:
-        """Ambil atau buat thread lock per OLT.
-        Untuk endpoint sync (def) yang jalan di threadpool FastAPI."""
+    def get_thread_lock(self, olt_id: str) -> threading.RLock:
+        """Ambil atau buat thread lock per OLT (reentrant).
+        RLock mencegah self-deadlock kalau helper internal acquire lock yang sama."""
         with self.thread_locks_guard:
             if olt_id not in self.thread_locks:
-                self.thread_locks[olt_id] = threading.Lock()
+                self.thread_locks[olt_id] = threading.RLock()
             return self.thread_locks[olt_id]
 
     # =================== CIRCUIT BREAKER ===================
@@ -381,6 +381,57 @@ def olt_locked(fn):
             return fn(*args, **kwargs)
 
     return wrapper
+
+
+# =================== CONTEXT MANAGER (fail-fast lock) ===================
+from contextlib import contextmanager
+from fastapi import HTTPException
+
+
+@contextmanager
+def olt_lock(key: str, timeout: float = None):
+    """Serialize akses ke OLT.
+
+    timeout=None -> blocking (background/scheduler)
+    timeout=N    -> fail-fast HTTP 503 (endpoint user-facing)
+    """
+    lock = olt_manager.get_thread_lock(key)
+    if timeout is None:
+        with lock:
+            yield
+        return
+
+    if not lock.acquire(timeout=timeout):
+        raise HTTPException(
+            status_code=503,
+            detail="OLT sedang sibuk, coba lagi sebentar",
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+# =================== ASYNC CONTEXT MANAGER ===================
+import asyncio
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def olt_lock_async(key: str, timeout: float = 5):
+    """Versi async dari olt_lock. Acquire via asyncio.to_thread
+    supaya tidak block event loop FastAPI."""
+    lock = olt_manager.get_thread_lock(key)
+    acquired = await asyncio.to_thread(lock.acquire, True, timeout)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="OLT sedang sibuk, coba lagi sebentar",
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 # =================== SINGLETON ===================

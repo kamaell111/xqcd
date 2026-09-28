@@ -3,6 +3,7 @@ const API = "/api/v1";
 let TOKEN = localStorage.getItem("token") || null;
 let CURRENT_USER = JSON.parse(localStorage.getItem("user") || "null");
 let CURRENT_OLT_ID = parseInt(localStorage.getItem("olt_id") || "0", 10) || null;
+let _currentOltName = "";   // nama OLT aktif untuk kolom OLT di tabel ONU
 let refreshTimer = null;
 let recoveryTimer = null;
 let lastRecoveryTs = 0;   // track timestamp recovery terakhir
@@ -202,7 +203,13 @@ async function switchOlt(newId) {
   if (!id || id === CURRENT_OLT_ID) return;
   CURRENT_OLT_ID = id;
   localStorage.setItem("olt_id", String(id));
-  console.log("[OLT] switch ke id=" + id);
+  // Update nama OLT aktif
+  try {
+    const olts = await api("/olts");
+    const cur = olts.find(o => o.id === id);
+    _currentOltName = (cur && cur.hostname) ? cur.hostname : ("OLT-" + id);
+  } catch (e) { _currentOltName = "OLT-" + id; }
+  console.log("[OLT] switch ke id=" + id + " name=" + _currentOltName);
 
   // Reset cache
   uncfgCache = null;
@@ -227,7 +234,9 @@ async function initCurrentOltId() {
     const found = olts.find(o => o.id === saved);
     CURRENT_OLT_ID = found ? found.id : olts[0].id;
     localStorage.setItem("olt_id", String(CURRENT_OLT_ID));
-    console.log(`[OLT] aktif: id=${CURRENT_OLT_ID}`);
+    const cur = olts.find(o => o.id === CURRENT_OLT_ID);
+    _currentOltName = (cur && cur.hostname) ? cur.hostname : ("OLT-" + CURRENT_OLT_ID);
+    console.log(`[OLT] aktif: id=${CURRENT_OLT_ID} name=${_currentOltName}`);
     return CURRENT_OLT_ID;
   } catch (e) {
     console.warn("[OLT] initCurrentOltId gagal:", e);
@@ -704,6 +713,11 @@ document.addEventListener("DOMContentLoaded", () => {
 // Auto-refresh halaman optical tiap 10s (existing auto-refresh 5s tidak include optical)
 setInterval(() => {
   if (currentPage === "optical") loadOpticalPage();
+}, 10000);
+
+// Auto-refresh halaman traffic tiap 10s
+setInterval(() => {
+  if (currentPage === "traffic") loadTrafficPage();
 }, 10000);
 function alertItemHTML(a, withCheckbox = false) {
   const icons = { critical: "fa-exclamation-circle", warning: "fa-exclamation-triangle", info: "fa-info-circle" };
@@ -1439,8 +1453,12 @@ async function loadTrafficPage(opts = {}) {
   const scope = document.getElementById("traffic-scope")?.value || "pon";
   const minutes = document.getElementById("traffic-period")?.value || "240";
 
+  const url = scope === "onu"
+    ? `/olts/${CURRENT_OLT_ID}/traffic/onu/recent?minutes=${minutes}`
+    : `/olts/${CURRENT_OLT_ID}/traffic/recent?scope=${scope}&minutes=${minutes}`;
+
   try {
-    const r = await api(`/olts/${CURRENT_OLT_ID}/traffic/recent?scope=${scope}&minutes=${minutes}`, opts);
+    const r = await api(url, opts);
     if (!r.entities || !r.entities.length) {
       el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-dim)">Tidak ada data traffic</div>';
       return;
@@ -1453,10 +1471,19 @@ async function loadTrafficPage(opts = {}) {
         : '<span class="traffic-card-badge idle">idle</span>';
       const rx = e.latest_rx_bps ? _fmtBps(e.latest_rx_bps) : "-";
       const tx = e.latest_tx_bps ? _fmtBps(e.latest_tx_bps) : "-";
+
+      // Scope ONU: title = label (nama/SN), subtitle = interface name
+      const isOnu = scope === "onu";
+      const title = isOnu && e.label ? e.label : e.name;
+      const subtitle = isOnu ? `<div class="traffic-card-sub">${escapeHtml(e.name)}${e.status ? " · " + escapeHtml(e.status) : ""}</div>` : "";
+
       return `
         <div class="traffic-card">
           <div class="traffic-card-head">
-            <span class="traffic-card-title">${escapeHtml(e.name)}</span>
+            <div style="flex:1;min-width:0">
+              <span class="traffic-card-title">${escapeHtml(title)}</span>
+              ${subtitle}
+            </div>
             ${badge}
           </div>
           <div class="traffic-stats">
@@ -1470,7 +1497,7 @@ async function loadTrafficPage(opts = {}) {
             </div>
           </div>
           <div class="traffic-chart-wrap">
-            <canvas id="chart-traffic-${e.ifindex || e.name.replace(/[^a-z0-9]/gi, "_")}"></canvas>
+            <canvas id="chart-traffic-${e.onu_id ? "onu_" + e.onu_id : (e.ifindex || e.name.replace(/[^a-z0-9]/gi, "_"))}"></canvas>
           </div>
         </div>
       `;
@@ -1479,7 +1506,7 @@ async function loadTrafficPage(opts = {}) {
     // Render charts
     setTimeout(() => {
       r.entities.forEach(e => {
-        const cid = "chart-traffic-" + (e.ifindex || e.name.replace(/[^a-z0-9]/gi, "_"));
+        const cid = "chart-traffic-" + (e.onu_id ? "onu_" + e.onu_id : (e.ifindex || e.name.replace(/[^a-z0-9]/gi, "_")));
         const canvas = document.getElementById(cid);
         if (!canvas) return;
 
@@ -1496,23 +1523,25 @@ async function loadTrafficPage(opts = {}) {
                 label: "Download",
                 data: rxData,
                 borderColor: "#fb5468",
-                backgroundColor: "rgba(251,84,104,0.08)",
-                borderWidth: 2,
+                backgroundColor: "rgba(251,84,104,0.12)",
+                borderWidth: 2.5,
                 fill: true,
                 tension: 0.35,
                 pointRadius: 0,
-                pointHoverRadius: 3,
+                pointHoverRadius: 4,
+                pointHoverBorderWidth: 2,
               },
               {
                 label: "Upload",
                 data: txData,
                 borderColor: "#4c7dff",
-                backgroundColor: "rgba(76,125,255,0.08)",
-                borderWidth: 2,
+                backgroundColor: "rgba(76,125,255,0.12)",
+                borderWidth: 2.5,
                 fill: true,
                 tension: 0.35,
                 pointRadius: 0,
-                pointHoverRadius: 3,
+                pointHoverRadius: 4,
+                pointHoverBorderWidth: 2,
               },
             ],
           },
@@ -1531,14 +1560,14 @@ async function loadTrafficPage(opts = {}) {
             },
             scales: {
               x: {
-                ticks: { color: "#8896b3", maxTicksLimit: 5, font: { size: 9 } },
+                ticks: { color: "#8896b3", maxTicksLimit: 6, font: { size: 10 } },
                 grid: { display: false },
                 border: { display: false },
               },
               y: {
                 beginAtZero: true,
-                ticks: { color: "#8896b3", font: { size: 9 }, maxTicksLimit: 4 },
-                grid: { color: "rgba(42,53,80,0.4)" },
+                ticks: { color: "#8896b3", font: { size: 10 }, maxTicksLimit: 5, padding: 6 },
+                grid: { color: "rgba(42,53,80,0.35)", drawTicks: false },
                 border: { display: false },
               },
             },
@@ -1593,13 +1622,14 @@ async function loadONUs(opts = {}) {
     el.innerHTML = `
       <div class="table-wrap"><table class="table-premium">
         <thead><tr>
-          <th>Interface</th><th>Serial Number</th><th>Nama</th><th>Merek</th><th>ONU</th>
+          <th>OLT</th><th>Interface</th><th>Serial Number</th><th>Nama</th><th>Merek</th><th>ONU</th>
           <th>Internet</th><th>RX (dBm)</th><th>Distance</th><th>VLAN</th><th>PPPoE</th><th>Aksi</th>
         </tr></thead>
         <tbody>
           ${filtered.map(o => `
             <tr>
-<td><b>${escapeHtml(o.interface_name || `${o.pon_port}:${o.onu_id}`)}</b></td>
+              <td><b>${escapeHtml(o.olt_hostname || _currentOltName || "-")}</b></td>
+              <td><b>${escapeHtml(o.interface_name || `${o.pon_port}:${o.onu_id}`)}</b></td>
               <td><code>${escapeHtml(o.serial_number || "-")}</code></td>
               <td>${escapeHtml(o.name || "-")}</td>
               <td>${renderVendorBadge(o)}</td>

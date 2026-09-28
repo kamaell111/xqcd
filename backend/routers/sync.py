@@ -13,6 +13,7 @@ from olt_manager import olt_locked
 from tenancy import require_olt_access
 from olt_client import LAST_READ_SHORT, LAST_READ_LONG
 from alerting import check_olt_resource_alerts, check_onu_alerts
+from config import settings
 
 
 # =================== CACHE ===================
@@ -22,11 +23,20 @@ import threading as _threading
 _RUNNING_CFG_CACHE = {}    # {olt_id: (raw, ts)}
 _ONU_STATE_CACHE = {}      # {olt_id: (raw, ts)}
 _UNCFG_CACHE = {}          # {olt_id: (raw, ts)}
+_OPTICAL_BULK_CACHE = {}   # {olt_id: ({onu_index: {...}}, ts)}
+_DETAIL_CACHE = {}         # {(olt_id, onu_index): (data, ts)}
 _CACHE_LOCK = _threading.Lock()
+
+# Auto-detect SNMP: kalau baru gagal < X detik, skip biar tidak buang timeout
+_SNMP_UNREACHABLE = {}     # {olt_id: ts_last_fail}
 
 _CACHE_TTL_RUNNING = 300   # 5 menit
 _CACHE_TTL_STATE = 30      # 30 detik
 _CACHE_TTL_UNCFG = 30      # 30 detik
+_CACHE_TTL_OPTICAL_BULK = settings.OPTICAL_CACHE_TTL_S   # dari env
+_CACHE_TTL_DETAIL = settings.DETAIL_CACHE_TTL_S   # dari env
+_MAX_DETAIL_QUERIES_PER_CYCLE = 30   # budget stagger
+_SNMP_RETRY_AFTER = 300         # 5 menit
 
 
 def invalidate_olt_cache(olt_id: int):
@@ -35,6 +45,11 @@ def invalidate_olt_cache(olt_id: int):
         _RUNNING_CFG_CACHE.pop(olt_id, None)
         _ONU_STATE_CACHE.pop(olt_id, None)
         _UNCFG_CACHE.pop(olt_id, None)
+        _OPTICAL_BULK_CACHE.pop(olt_id, None)
+        # Detail cache per (olt_id, onu_index)
+        stale_keys = [k for k in _DETAIL_CACHE.keys() if k[0] == olt_id]
+        for k in stale_keys:
+            _DETAIL_CACHE.pop(k, None)
     print(f"[CACHE] invalidate olt_id={olt_id}")
 
 
@@ -478,6 +493,80 @@ def _parse_attenuation(output: str) -> dict:
     return r
 
 
+def _is_snmp_reachable(olt_id) -> bool:
+    """Auto-detect SNMP: return False kalau baru gagal < _SNMP_RETRY_AFTER detik."""
+    ts = _SNMP_UNREACHABLE.get(olt_id)
+    if ts is None:
+        return True
+    return (_time_mod.time() - ts) > _SNMP_RETRY_AFTER
+
+
+def _get_detail_cached(conn, olt_id, onu_idx, query_budget: list):
+    """Ambil detail ONU dari cache. Query ke OLT cuma kalau expired DAN budget masih ada.
+
+    query_budget adalah list [sisa_budget] — dimodifikasi di tempat.
+    Return: dict detail atau None.
+    """
+    key = (olt_id, onu_idx)
+    now = _time_mod.time()
+    entry = _DETAIL_CACHE.get(key)
+
+    if entry:
+        data, ts = entry
+        if (now - ts) < _CACHE_TTL_DETAIL:
+            return data  # fresh
+
+    # expired atau belum ada — cek budget
+    if query_budget[0] <= 0:
+        return entry[0] if entry else None   # pakai stale, jangan query
+
+    try:
+        det_cmd = f"show gpon onu detail-info gpon-onu_{onu_idx}"
+        det_out = conn.send_command_timing(det_cmd, read_timeout=30, last_read=LAST_READ_LONG)
+        data = _parse_onu_detail(det_out)
+        _DETAIL_CACHE[key] = (data, now)
+        query_budget[0] -= 1
+        return data
+    except Exception as e:
+        print(f"[DETAIL] {onu_idx} error: {e}")
+        return entry[0] if entry else None
+
+
+def _fetch_bulk_optical(conn, olt_id, active_pons):
+    """Ambil optical bulk per PON. Return {onu_index: {"onu_rx": float, "onu_tx": float}}."""
+    from zxan_parser import parse_pon_power_onu_rx, parse_pon_power_onu_tx
+
+    cached = _cache_get(_OPTICAL_BULK_CACHE, olt_id, _CACHE_TTL_OPTICAL_BULK)
+    if cached is not None:
+        print(f"[CACHE] optical-bulk HIT (olt_id={olt_id})")
+        return cached
+
+    result = {}
+    for pon in active_pons:
+        try:
+            rx_out = conn.send_command_timing(
+                f"show pon power onu-rx {pon}",
+                read_timeout=15, last_read=LAST_READ_SHORT,
+            )
+            for idx, val in parse_pon_power_onu_rx(rx_out).items():
+                result.setdefault(idx, {})["onu_rx"] = val
+        except Exception as e:
+            print(f"[OPTICAL-BULK] {pon} rx error: {e}")
+        try:
+            tx_out = conn.send_command_timing(
+                f"show pon power onu-tx {pon}",
+                read_timeout=15, last_read=LAST_READ_SHORT,
+            )
+            for idx, val in parse_pon_power_onu_tx(tx_out).items():
+                result.setdefault(idx, {})["onu_tx"] = val
+        except Exception as e:
+            print(f"[OPTICAL-BULK] {pon} tx error: {e}")
+
+    _cache_set(_OPTICAL_BULK_CACHE, olt_id, result)
+    print(f"[OPTICAL-BULK] {len(result)} ONU dari {len(active_pons)} PON")
+    return result
+
+
 def _do_sync_pons(db: Session, olt: OLT) -> dict:
     """Core sync PON + ONU — dipakai endpoint DAN scheduler.
     Raise Exception kalau gagal. Caller yang handle commit + audit."""
@@ -522,29 +611,46 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
             # Ambil optical + pppoe status untuk setiap ONU
             import re as _re2
 
-            # ⚡ SNMP walk dulu (1-2 detik untuk 100+ ONU) — optical + distance
+            # ⚡ Auto-detect SNMP — skip kalau baru gagal < _SNMP_RETRY_AFTER
             snmp_data = {}
-            if olt.snmp_community_ro:
+            if olt.snmp_community_ro and _is_snmp_reachable(olt_id):
                 try:
                     from olt_snmp import OltSnmpClient
-                    async def _do_snmp():
-                        c = OltSnmpClient(olt.ip_address, olt.snmp_community_ro,
-                                          port=olt.snmp_port or 161)
-                        return await c.list_onus()
+                    c = OltSnmpClient(olt.ip_address, olt.snmp_community_ro,
+                                      port=olt.snmp_port or 161)
                     loop = asyncio.new_event_loop()
                     try:
-                        snmp_onus = loop.run_until_complete(_do_snmp())
+                        snmp_onus = loop.run_until_complete(c.list_onus())
                     finally:
                         loop.close()
-                    for so in snmp_onus:
-                        pon_num = 1 + (so.pon_idx - 268501248) // 256
-                        snmp_data[f"1/1/{pon_num}:{so.onu_id}"] = so
-                    print(f"[SNMP] {len(snmp_data)} ONU via SNMP")
+                    if snmp_onus:
+                        for so in snmp_onus:
+                            pon_num = 1 + (so.pon_idx - 268501248) // 256
+                            snmp_data[f"1/1/{pon_num}:{so.onu_id}"] = so
+                        print(f"[SNMP] {len(snmp_data)} ONU via SNMP")
+                        _SNMP_UNREACHABLE.pop(olt_id, None)
+                    else:
+                        print(f"[SNMP] 0 ONU — tandai unreachable 5 menit")
+                        _SNMP_UNREACHABLE[olt_id] = _time_mod.time()
                 except Exception as e:
-                    print(f"[SNMP] gagal: {e} — fallback Telnet untuk optical")
+                    print(f"[SNMP] gagal: {e} — tandai unreachable 5 menit")
+                    _SNMP_UNREACHABLE[olt_id] = _time_mod.time()
+            elif olt.snmp_community_ro:
+                print(f"[SNMP] skip — baru gagal < 5 menit, pakai Telnet")
 
             # ⚡ Pre-parse state untuk tahu mana ONU online (skip PPPoE kalau offline)
             _onu_state_pre = _parse_onu_state(onu_state_out)
+            _detail_budget = [_MAX_DETAIL_QUERIES_PER_CYCLE]
+
+            # ⚡ Bulk optical per-PON (1 perintah per PON, jauh lebih cepat dari per-ONU)
+            _pous_set = set()
+            for _o in _onu_state_pre:
+                _pp = _o.get("pon_port")
+                if _pp:
+                    _pous_set.add(f"gpon-olt_{_pp}")
+            optical_bulk = {}
+            if _pous_set:
+                optical_bulk = _fetch_bulk_optical(conn, olt_id, sorted(_pous_set))
 
             # ⚡ Pre-fetch ONU rows dari DB untuk cek cache PPPoE
             from models import ONU as _ONU
@@ -552,7 +658,7 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
             for _o in db.query(_ONU).filter(_ONU.olt_id == olt_id).all():
                 _key = f"{_o.pon_port}:{_o.onu_id}"
                 _onu_cache[_key] = _o
-            _pppoe_ttl = 300   # detik — cache PPPoE (test: 300s)
+            _pppoe_ttl = settings.PPPOE_CACHE_TTL_S   # dari env
             online_idxs = set()
             for _o in _onu_state_pre:
                 if (_o.get("phase_state") or "").lower().strip() == "working":
@@ -563,8 +669,14 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                 idx = m.group(1)
                 so = snmp_data.get(idx)
 
-                # Optical: SNMP dulu, fallback Telnet
-                if so is not None and so.rx_dbm is not None:
+                # Optical: prioritas bulk → SNMP → fallback per-ONU
+                _bulk = optical_bulk.get(idx)
+                if _bulk and (_bulk.get("onu_rx") is not None or _bulk.get("onu_tx") is not None):
+                    optical_map[idx] = {
+                        "onu_rx": _bulk.get("onu_rx"),
+                        "onu_tx": _bulk.get("onu_tx"),
+                    }
+                elif so is not None and so.rx_dbm is not None:
                     optical_map[idx] = {"onu_rx": so.rx_dbm, "onu_tx": so.tx_dbm}
                 else:
                     try:
@@ -619,16 +731,13 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                                 print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
                         except Exception as e:
                             print(f"[PPPOE] {idx} error: {e}")
-                # Detail: distance — SNMP dulu, fallback Telnet
+                # Detail: cache-aware, budget 30 per siklus
                 if so is not None and so.distance_m is not None:
                     detail_map[idx] = {"distance": so.distance_m, "online_duration": None}
                 else:
-                    try:
-                        det_cmd = f"show gpon onu detail-info gpon-onu_{idx}"
-                        det_out = conn.send_command_timing(det_cmd, read_timeout=30, last_read=LAST_READ_LONG)
-                        detail_map[idx] = _parse_onu_detail(det_out)
-                    except Exception as e:
-                        print(f"[DETAIL] {idx} error: {e}")
+                    det = _get_detail_cached(conn, olt_id, idx, _detail_budget)
+                    if det:
+                        detail_map[idx] = det
         finally:
             conn.disconnect()
     except Exception as e:

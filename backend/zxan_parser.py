@@ -208,3 +208,107 @@ def get_vendor_info(req) -> dict:
         requested_vendor=getattr(req, "vendor", None),
         requested_mode=getattr(req, "provisioning_mode", None),
     )
+
+# =================== TRAFFIC COUNTER PARSER (Telnet bulk) ===================
+
+def parse_pon_traffic_counter(text: str) -> Dict:
+    """Parse 'show interface gpon-olt_X/X/X' → {rx_octets, tx_octets}.
+
+    Sumber: blok 'Total statistic' → 'Input :' / 'Output :' → 'PassBytes :N'.
+    """
+    rx = tx = None
+    block = None
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"^(Input|Output)\s*:\s*$", s)
+        if m:
+            block = m.group(1).lower()
+            continue
+        if block:
+            mm = re.search(r"\bPassBytes\s*:\s*(\d+)", s)
+            if mm:
+                if block == "input" and rx is None:
+                    rx = int(mm.group(1))
+                elif block == "output" and tx is None:
+                    tx = int(mm.group(1))
+    return {"rx_octets": rx, "tx_octets": tx}
+
+
+def parse_uplink_traffic_counter(text: str) -> Dict:
+    """Parse 'show interface gei_X/X/X' (uplink) → {rx_octets, tx_octets}.
+
+    Sumber: blok 'Input:' / 'Output:' → 'Bytes : N'.
+    """
+    rx = tx = None
+    block = None
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"^(Input|Output)\s*:\s*$", s)
+        if m:
+            block = m.group(1).lower()
+            continue
+        if block:
+            mm = re.search(r"\bBytes\s*:\s*(\d+)", s)
+            if mm:
+                if block == "input" and rx is None:
+                    rx = int(mm.group(1))
+                elif block == "output" and tx is None:
+                    tx = int(mm.group(1))
+    return {"rx_octets": rx, "tx_octets": tx}
+
+
+# =================== BULK OPTICAL PARSER (per PON) ===================
+
+def parse_pon_power_onu_rx(text: str) -> dict:
+    """Parse 'show pon power onu-rx gpon-olt_X/X/X' → {onu_index: rx_dbm}.
+
+    Format:
+        Onu                 Rx power
+        ------------------------------------
+        gpon-onu_1/1/1:1    -17.144(dbm)
+    """
+    result = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*(gpon-onu_\S+)\s+(-?[\d.]+)\s*\(dbm\)", line)
+        if m:
+            try:
+                result[m.group(1)] = float(m.group(2))
+            except ValueError:
+                continue
+    return result
+
+
+def parse_pon_power_onu_tx(text: str) -> dict:
+    """Parse 'show pon power onu-tx gpon-olt_X/X/X' → {onu_index: tx_dbm}."""
+    result = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*(gpon-onu_\S+)\s+(-?[\d.]+)\s*\(dbm\)", line)
+        if m:
+            try:
+                result[m.group(1)] = float(m.group(2))
+            except ValueError:
+                continue
+    return result
+
+
+def parse_onu_traffic_counter(text: str) -> Dict:
+    """Parse 'show interface gpon-onu_X:X' → {rx_octets, tx_octets}.
+
+    Blok 'Total statistic' → 'Input:' / 'Output:' → 'Bytes:N'.
+    """
+    rx = tx = None
+    block = None
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"^(Input|Output)\s*:\s*$", s)
+        if m:
+            block = m.group(1).lower()
+            continue
+        if block:
+            mm = re.search(r"\bBytes:(\d+)", s)
+            if mm:
+                if block == "input" and rx is None:
+                    rx = int(mm.group(1))
+                elif block == "output" and tx is None:
+                    tx = int(mm.group(1))
+    return {"rx_octets": rx, "tx_octets": tx}

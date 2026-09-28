@@ -317,6 +317,86 @@ async def _backup_job():
         print(f"[BACKUP] Error: {e}")
 
 
+async def _sync_pons_job():
+    """Sync status PON + ONU (state, optical, detail) tiap 30 detik.
+
+    Ini yang bikin notifikasi ONU mati muncul cepat — dulu cuma startup + manual.
+    Pakai cache internal (state 30s, optical 2m, detail 10m) biar beban OLT ringan.
+    """
+    from routers.sync import _do_sync_pons
+    from olt_manager import olt_manager
+
+    db = SessionLocal()
+    try:
+        olts = db.query(OLT).filter(OLT.enabled == 1).all()
+        for olt in olts:
+            reason = olt_manager.is_olt_circuit_open(str(olt.id))
+            if reason:
+                continue
+            lock = olt_manager.get_thread_lock(str(olt.id))
+            if not lock.acquire(blocking=False):
+                # OLT sedang dipakai job lain — skip siklus ini
+                continue
+
+            def _worker(_oid=olt.id):
+                t_db = SessionLocal()
+                try:
+                    t_olt = t_db.query(OLT).get(_oid)
+                    if not t_olt:
+                        return ("not_found", None)
+                    _do_sync_pons(t_db, t_olt)
+                    return ("ok", None)
+                except Exception as e:
+                    return ("err", str(e))
+                finally:
+                    t_db.close()
+
+            try:
+                import asyncio as _aio
+                status, err = await _aio.to_thread(_worker)
+                if status == "ok":
+                    print(f"[SYNC-PONS] OLT {olt.id} OK")
+                elif status == "err":
+                    print(f"[SYNC-PONS] OLT {olt.id} gagal: {err}")
+                    olt_manager.record_olt_result(str(olt.id), False, err)
+            except Exception as e:
+                print(f"[SYNC-PONS] {olt.id} error coroutine: {e}")
+            finally:
+                lock.release()
+    finally:
+        db.close()
+
+
+async def _poll_onu_traffic_job():
+    """Poll traffic per-ONU batch (round-robin) tiap 60 detik."""
+    from olt_manager import olt_manager
+    from traffic_poller import poll_traffic_onu_batch
+
+    db = SessionLocal()
+    try:
+        olts = db.query(OLT).filter(OLT.enabled == 1).all()
+        for olt in olts:
+            reason = olt_manager.is_olt_circuit_open(str(olt.id))
+            if reason:
+                continue
+            lock = olt_manager.get_thread_lock(str(olt.id))
+            if not lock.acquire(blocking=False):
+                continue
+            try:
+                result = await asyncio.to_thread(poll_traffic_onu_batch, db, olt)
+                if result.get("ok"):
+                    print(f"[ONU-TRAFFIC] {olt.ip_address} · {result['saved']}/{result['batch']} sample (total {result['total']} ONU)")
+                else:
+                    print(f"[ONU-TRAFFIC] {olt.ip_address} gagal: {result.get('error')}")
+            except Exception as e:
+                print(f"[ONU-TRAFFIC] {olt.id} error: {type(e).__name__}: {e}")
+                db.rollback()
+            finally:
+                lock.release()
+    finally:
+        db.close()
+
+
 async def _retention_job():
     """Job background: hapus data lama + VACUUM."""
     db = SessionLocal()
@@ -423,7 +503,7 @@ async def _poll_traffic_job():
                 print(f"[TRAFFIC-POLL] OLT {olt.id} sibuk, skip")
                 continue
             try:
-                result = await poll_traffic_for_olt(db, olt)
+                result = await asyncio.to_thread(poll_traffic_for_olt, db, olt)
                 if result.get("ok"):
                     print(f"[TRAFFIC-POLL] {olt.ip_address} OK · {result['saved']} sample")
                 else:
@@ -451,6 +531,18 @@ async def lifespan(app: FastAPI):
         coalesce=True,             # gabung misfire jadi 1x
         misfire_grace_time=30,     # toleransi 30s kalau telat
     )
+    # ⭐ Sync PON + ONU tiap 30s (offset 15s dari poll_olts biar tidak tabrakan)
+    from datetime import timedelta as _td
+    _now = datetime.utcnow()
+    scheduler.add_job(
+        _sync_pons_job, "interval",
+        seconds=30,
+        id="sync_pons",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=15,
+        next_run_time=_now + _td(seconds=15),
+    )
     # ⭐ Retention job: hapus data lama tiap 24 jam
     scheduler.add_job(
         _poll_traffic_job, "interval",
@@ -459,6 +551,14 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
         misfire_grace_time=120,
+    )
+    scheduler.add_job(
+        _poll_onu_traffic_job, "interval",
+        seconds=60,
+        id="poll_onu_traffic",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
     )
     scheduler.add_job(
         _retention_job, "interval",

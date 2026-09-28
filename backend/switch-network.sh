@@ -1,21 +1,33 @@
 #!/bin/bash
-# Script ganti IP OLT: LAN (kantor) atau Publik (rumah)
+# Script ganti IP OLT di .env — pakai env var agar tidak ada IP asli di source.
+#
+# Pemakaian:
+#   OFFICE_OLT_IP=10.0.0.1   OFFICE_OLT_PORT=23   ./switch-network.sh office
+#   HOME_OLT_IP=1.2.3.4      HOME_OLT_PORT=779    ./switch-network.sh home
+#
+# Simpan nilai asli di shell profile (~/.bashrc) atau file lokal yang tidak di-commit.
 
-if [ "$1" == "home" ]; then
-    sed -i 's/^SEED_OLT_IP=.*/SEED_OLT_IP=103.46.8.46/' .env
-    sed -i 's/^SEED_OLT_PORT=.*/SEED_OLT_PORT=779/' .env
-    echo "✅ Mode RUMAH (IP publik)"
-elif [ "$1" == "office" ]; then
-    sed -i 's/^SEED_OLT_IP=.*/SEED_OLT_IP=136.1.1.200/' .env
-    sed -i 's/^SEED_OLT_PORT=.*/SEED_OLT_PORT=23/' .env
-    echo "✅ Mode KANTOR (IP LAN)"
+set -e
+
+mode="${1:-}"
+if [ "$mode" == "home" ]; then
+    ip="${HOME_OLT_IP:?Set HOME_OLT_IP env var dulu}"
+    port="${HOME_OLT_PORT:-779}"
+    label="RUMAH (publik)"
+elif [ "$mode" == "office" ]; then
+    ip="${OFFICE_OLT_IP:?Set OFFICE_OLT_IP env var dulu}"
+    port="${OFFICE_OLT_PORT:-23}"
+    label="KANTOR (LAN)"
 else
     echo "Usage: ./switch-network.sh {home|office}"
-    echo "  home   = pakai IP publik (dari rumah)"
-    echo "  office = pakai IP LAN (dari kantor)"
+    echo "Set env var dulu, contoh:"
+    echo "  export OFFICE_OLT_IP=10.0.0.1 OFFICE_OLT_PORT=23"
+    echo "  export HOME_OLT_IP=1.2.3.4   HOME_OLT_PORT=779"
     exit 1
 fi
 
+sed -i "s/^SEED_OLT_IP=.*/SEED_OLT_IP=${ip}/" .env
+sed -i "s/^SEED_OLT_PORT=.*/SEED_OLT_PORT=${port}/" .env
+echo "✅ Mode ${label}: ${ip}:${port}"
 echo ""
-echo "Current:"
 grep SEED_OLT .env

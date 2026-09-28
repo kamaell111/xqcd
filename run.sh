@@ -8,7 +8,7 @@
 #   - Copy .env.example jadi .env (kalau belum ada)
 #   - Buat virtual environment (kalau belum ada)
 #   - Install dependencies
-#   - Start uvicorn di port 8001
+#   - Start uvicorn di port 8002
 
 set -e
 
@@ -58,9 +58,9 @@ pip install -q -r backend/requirements.txt
 
 # 6. Start uvicorn
 echo ""
-echo "[run] Start aplikasi di http://localhost:8001"
+echo "[run] Start aplikasi di http://localhost:8002"
 echo "      Login: cek backend/.env (SEED_ADMIN_USERNAME / SEED_ADMIN_PASSWORD)"
 echo "      Stop: Ctrl+C"
 echo ""
 cd backend
-uvicorn app:app --host 0.0.0.0 --port 8001
+uvicorn app:app --host 0.0.0.0 --port 8002

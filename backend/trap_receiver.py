@@ -48,7 +48,7 @@ class ZTETrapProtocol(asyncio.DatagramProtocol):
         raw_text = data.decode("latin-1", errors="ignore")
 
         # Extract eventid dari community string ZTE
-        # Format: bagoes_ro@eventid=21010@eventLevel=major@confirm@20260917114255
+        # Format: <community>@eventid=21010@eventLevel=major@confirm@<timestamp>
         # Note: ada "@confirm@" opsional antara eventLevel dan timestamp
         # ⭐ Pakai IGNORECASE — payload ZTE pakai "eventId" (I kapital)
         m = re.search(r"eventid=(\d+)@eventlevel=(\w+)", raw_text, re.IGNORECASE)
