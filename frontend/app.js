@@ -1136,14 +1136,14 @@ function _renderOltModal(info) {
     '<div class="form-group"><label>IP Address</label><input id="olt-ip" type="text" placeholder="Contoh: 192.168.1.100" value="' + escapeHtml(v.ip_address || "") + '"></div>' +
     '<div class="form-group"><label>Type &amp; Hardware (Driver)</label><select id="olt-driver">' + driverOpts + '</select></div>' +
     '<div class="form-group"><label>Hardware Type</label><select id="olt-hardware">' + hwOptions + '</select></div>' +
-    '<h4 style="margin:20px 0 10px;font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em">SNMP</h4>' +
-    '<div class="form-group"><label>Community RO</label><input id="olt-snmp-ro" type="text" placeholder="public" value="' + escapeHtml(v.snmp_community_ro || "public") + '"></div>' +
-    '<div class="form-group"><label>SNMP Port</label><input id="olt-snmp-port" type="number" min="1" max="65535" value="' + (v.snmp_port || 161) + '"></div>' +
-    '<h4 style="margin:20px 0 10px;font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em">Telnet</h4>' +
+    '<h4 style="margin:20px 0 10px;font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em">Telnet (wajib)</h4>' +
     '<div class="form-group"><label>Username</label><input id="olt-username" type="text" value="' + escapeHtml(v.username || "") + '"></div>' +
     '<div class="form-group"><label>Password</label><input id="olt-password" type="password" placeholder="' + pwPlaceholder + '" value=""></div>' +
     '<div class="form-group"><label>Enable Password (opsional)</label><input id="olt-enable" type="password" placeholder="' + (isEdit ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (kosongkan jika tidak diubah)" : "zxr10") + '" value=""></div>' +
-    '<div class="form-group"><label>Port</label><input id="olt-port" type="number" min="1" max="65535" value="' + (v.port || 23) + '"></div>' +
+    '<div class="form-group"><label>Telnet Port</label><input id="olt-port" type="number" min="1" max="65535" value="' + (v.port || 23) + '"><small style="color:var(--text-dim);font-size:11px;display:block;margin-top:4px">Standar 23 (LAN). Pakai 779 jika lewat IP publik.</small></div>' +
+    '<h4 style="margin:20px 0 10px;font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em">SNMP (opsional)</h4>' +
+    '<div class="form-group"><label>SNMP Community RO</label><input id="olt-snmp-ro" type="text" placeholder="public" value="' + escapeHtml(v.snmp_community_ro || "public") + '"></div>' +
+    '<div class="form-group"><label>SNMP Port</label><input id="olt-snmp-port" type="number" min="1" max="65535" value="' + (v.snmp_port || 161) + '"><small style="color:var(--text-dim);font-size:11px;display:block;margin-top:4px">Standar 161. Biarkan default jika OLT tidak diakses via SNMP.</small></div>' +
     '<div class="form-group"><label>Location (opsional)</label><input id="olt-location" type="text" value="' + escapeHtml(v.location || "") + '"></div>' +
     '<div id="olt-test-result" class="olt-test-result"></div>';
 
