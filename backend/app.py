@@ -106,6 +106,12 @@ def migrate_db():
 
 
 def seed_data():
+    """Seed user awal. Admin pertama otomatis jadi Multivers (super admin).
+
+    OLT TIDAK di-seed — user harus menambahkan sendiri lewat menu OLT,
+    supaya setiap instalasi punya konfigurasi sesuai kebutuhan masing-masing
+    dan tidak ada data placeholder yang bikin bingung.
+    """
     db = SessionLocal()
     try:
         if db.query(User).count() > 0:
@@ -113,7 +119,7 @@ def seed_data():
         db.add_all([
             User(username=settings.SEED_ADMIN_USERNAME,
                  password_hash=hash_password(settings.SEED_ADMIN_PASSWORD),
-                 privilege=15, role="admin"),
+                 privilege=15, role="admin", is_super_admin=1),
             User(username=settings.SEED_OPERATOR_USERNAME,
                  password_hash=hash_password(settings.SEED_OPERATOR_PASSWORD),
                  privilege=10, role="operator"),
@@ -121,75 +127,15 @@ def seed_data():
                  password_hash=hash_password(settings.SEED_VIEWER_PASSWORD),
                  privilege=5, role="viewer"),
         ])
-
-        olt = OLT(
-            hostname=settings.SEED_OLT_HOSTNAME,
-            ip_address=settings.SEED_OLT_IP,
-            protocol=settings.SEED_OLT_PROTOCOL,
-            port=settings.SEED_OLT_PORT,
-            username=settings.SEED_OLT_USERNAME,
-            password=settings.SEED_OLT_PASSWORD,
-            enable_password=settings.SEED_OLT_ENABLE_PASSWORD or None,
-            snmp_community_ro=settings.SEED_OLT_SNMP_RO,
-            snmp_community_rw=settings.SEED_OLT_SNMP_RW,
-            model="C320", firmware="V2.1.0", location="",
-            status="unknown", cpu_usage=None, memory_usage=None,
-            uptime_seconds=None, temperature=None,
-        )
-        db.add(olt)
         db.commit()
-        db.refresh(olt)
-
-        for i in range(1, 17):
-            db.add(PONPort(
-                olt_id=olt.id, port_no=f"1/1/{i}",
-                status="up" if i == 1 else "shutdown",
-                admin_state="no shutdown" if i == 1 else "shutdown",
-                linktrap=False,
-                optical_tx=-3.5 if i == 1 else None,
-                optical_rx=-12.8 if i == 1 else None,
-                onu_count=1 if i == 1 else 0,
-            ))
-
-        db.add(ONU(
-            olt_id=olt.id, pon_port="1/1/1", onu_id=1,
-            interface_name="gpon-onu_1/1/1:1",
-            serial_number="YYKC37D4BADA", name="CLIENT-YYKC37D4",
-            type="F609", status="online",
-            optical_tx=2.5, optical_rx=-18.3, distance=1240,
-            tcont="1G", gemport=1, service_port=1,
-            user_vlan=15, vlan=15, pppoe_user="zte", pppoe_nat=True,
-            last_online=datetime.utcnow(),
-        ))
-
-        ifaces = [
-            dict(name="gei_1/3/1", type="gei", status="up", admin_state="no shutdown",
-                 speed=1000, duplex="full", negotiation="auto", linktrap=True,
-                 switchport_mode="trunk", vlans="1-2", hybrid_attribute="fiber"),
-            dict(name="xgei_1/3/2", type="xgei", status="up", admin_state="no shutdown",
-                 speed=10000, duplex="full", negotiation="manual", linktrap=True,
-                 switchport_mode="trunk", vlans="1-2", hybrid_attribute="fiber"),
-            dict(name="gei_1/3/3", type="gei", status="up", admin_state="no shutdown",
-                 speed=1000, duplex="full", negotiation="auto", linktrap=True,
-                 switchport_mode="trunk", vlans="1-2,15,101", hybrid_attribute="copper"),
-            dict(name="gei_1/4/1", type="gei", status="up", admin_state="no shutdown",
-                 speed=1000, duplex="full", negotiation="auto", linktrap=True,
-                 switchport_mode="trunk", vlans="1", hybrid_attribute="fiber"),
-            dict(name="xgei_1/4/2", type="xgei", status="up", admin_state="no shutdown",
-                 speed=10000, duplex="full", negotiation="manual", linktrap=True,
-                 switchport_mode="trunk", vlans="1", hybrid_attribute="fiber"),
-            dict(name="gei_1/4/3", type="gei", status="down", admin_state="shutdown",
-                 speed=1000, duplex="full", negotiation="auto", linktrap=True,
-                 switchport_mode="trunk", vlans="1", hybrid_attribute="copper"),
-        ]
-        for iface in ifaces:
-            db.add(Interface(olt_id=olt.id, **iface))
-
-        for v in [1, 2, 15, 101]:
-            db.add(VLAN(olt_id=olt.id, vlan_id=v, name=f"VLAN{v}"))
-
-        db.commit()
-        print("Seed data berhasil (tanpa alert dummy)")
+        print("=" * 60)
+        print("Seed user berhasil — admin = Multivers (super admin)")
+        print(f"  Login: {settings.SEED_ADMIN_USERNAME} / {settings.SEED_ADMIN_PASSWORD}")
+        print("  Langkah berikutnya:")
+        print("    1. Login ke aplikasi")
+        print("    2. Menu OLT → Tambah OLT → isi IP/user/password OLT Anda")
+        print("    3. Tunggu sync otomatis (~30-60 detik)")
+        print("=" * 60)
     finally:
         db.close()
 
