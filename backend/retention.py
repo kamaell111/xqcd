@@ -75,6 +75,6 @@ def log_retention(stats: dict):
     """Print ringkas hasil retention."""
     total = sum(v for k, v in stats.items() if isinstance(v, int))
     if total == 0 and stats.get("vacuum") == "ok":
-        print(f"[RETENTION] Tidak ada data lama. Vacuum OK.")
+        print("[RETENTION] Tidak ada data lama. Vacuum OK.")
     else:
         print(f"[RETENTION] Dihapus: {stats}")

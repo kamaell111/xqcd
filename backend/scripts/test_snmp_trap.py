@@ -5,9 +5,9 @@ from datetime import datetime
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 162
 
-print(f"=== SNMP Trap Listener ===")
+print("=== SNMP Trap Listener ===")
 print(f"Listening di {LISTEN_IP}:{LISTEN_PORT}")
-print(f"Tunggu trap... (Ctrl+C untuk stop)")
+print("Tunggu trap... (Ctrl+C untuk stop)")
 print()
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

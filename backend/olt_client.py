@@ -265,7 +265,7 @@ class OLTClient(StrictConfigMixin):
                     output_lines.append(out)
                     # Kalau ada error, log
                     if any(k in out for k in ("Error", "Invalid", "Incomplete", "unknown ME", "Ambiguous")):
-                        output_lines.append(f"    [WARN] command mungkin gagal")
+                        output_lines.append("    [WARN] command mungkin gagal")
                 except Exception as e:
                     output_lines.append(f">>> {cmd}")
                     output_lines.append(f"    [ERROR] {e}")

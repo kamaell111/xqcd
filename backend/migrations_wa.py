@@ -29,7 +29,7 @@ def migrate_wa_engine(engine) -> None:
                                       WHERE r.scope_key = wa_settings.scope_key
                                         AND r.enabled = 1)
                     """)
-                    print(f"[migrations_wa] OK: backfill engine_enabled=1 untuk scope aktif")
+                    print("[migrations_wa] OK: backfill engine_enabled=1 untuk scope aktif")
                 else:
                     print(f"[migrations_wa] NOTE: env WA_ALERT_ENABLED={env_val}, backfill dilewati")
 
