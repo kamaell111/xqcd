@@ -1,0 +1,83 @@
+<!-- ======================================================================
+     ITERASI 2 — DEVICE BAR COMPACT
+     Gantikan blok <div class="hero-card" id="hero-card"> ... </div>.
+     Bagian lain di dashboard TIDAK disentuh.
+
+     Id yang dipertahankan (diisi app.js via textContent):
+       hero-card, hero-hostname, hero-ip, hero-firmware, hero-location,
+       hero-uptime, hero-onus, hero-pons
+     Data yang tetap tampil: hostname, model (OLT ZTE C320), IP, firmware,
+       lokasi, ONU aktif, PON aktif, uptime.
+     Dihapus karena murni dekorasi: .hero-bg (pola kotak-kotak).
+
+     Baru dan tidak diisi app.js: #olt-bar-status. Badge ini menyalin status
+     dari pill header (#olt-status-text) lewat script kecil di bawah, jadi
+     app.js tidak perlu diubah.
+     ====================================================================== -->
+<section class="olt-bar" id="hero-card">
+
+  <div class="olt-bar-device">
+    <div class="olt-bar-icon">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+    </div>
+    <div class="olt-bar-id">
+      <div class="olt-bar-title">
+        <h3 class="olt-bar-name" id="hero-hostname">ZXAN</h3>
+        <span class="olt-bar-status" id="olt-bar-status"><span class="olt-bar-dot"></span><span id="olt-bar-status-text">...</span></span>
+        <span class="olt-bar-model">OLT ZTE C320</span>
+      </div>
+      <div class="olt-bar-meta">
+        <span title="Alamat manajemen"><span id="hero-ip">-</span></span>
+        <span title="Versi firmware"><span id="hero-firmware">-</span></span>
+        <span title="Lokasi perangkat"><span id="hero-location">-</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="olt-bar-stats">
+    <div class="olt-bar-stat">
+      <div class="olt-bar-value" id="hero-onus">-</div>
+      <div class="olt-bar-label">ONU aktif</div>
+    </div>
+    <div class="olt-bar-stat">
+      <div class="olt-bar-value" id="hero-pons">-</div>
+      <div class="olt-bar-label">PON aktif</div>
+    </div>
+    <div class="olt-bar-stat">
+      <div class="olt-bar-value" id="hero-uptime">-</div>
+      <div class="olt-bar-label">Uptime</div>
+    </div>
+  </div>
+
+  <div class="olt-bar-actions">
+    <!-- Sync memicu tombol refresh header yang sudah ada (handler-nya sudah dipasang app.js) -->
+    <button type="button" class="olt-bar-btn olt-bar-btn--primary" onclick="document.getElementById('refresh-btn').click()">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+      Sync
+    </button>
+    <button type="button" class="olt-bar-btn" onclick="openConfigCommitPanel()">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>
+      Save Config
+    </button>
+  </div>
+</section>
+
+<script>
+/* Salin status dari pill header ("ZXAN · online") ke badge device bar */
+(function () {
+  var src = document.getElementById('olt-status-text');
+  var badge = document.getElementById('olt-bar-status');
+  var txt = document.getElementById('olt-bar-status-text');
+  if (!src || !badge || !txt) return;
+  function sync() {
+    var t = (src.textContent || '').trim();
+    var s = t.split('·').pop().trim() || t;
+    txt.textContent = s;
+    var low = s.toLowerCase();
+    badge.classList.toggle('is-online', low === 'online');
+    badge.classList.toggle('is-offline', low === 'offline');
+  }
+  new MutationObserver(sync).observe(src, { childList: true, characterData: true, subtree: true });
+  sync();
+})();
+</script>

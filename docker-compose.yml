@@ -1,0 +1,33 @@
+services:
+  olt-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: olt-manager:latest
+    container_name: olt-manager
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./backend/.env:/app/backend/.env:ro
+      - ./backend/data:/app/backend/data
+      - ./backend/routers/.wa_fernet.key:/app/backend/routers/.wa_fernet.key
+      - ./logs:/app/backend/logs
+    environment:
+      - TZ=Asia/Jakarta
+      - PYTHONUNBUFFERED=1
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

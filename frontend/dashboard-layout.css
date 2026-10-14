@@ -1,0 +1,71 @@
+/* ==========================================================================
+   ITERASI 3 — LAYOUT DASHBOARD
+   APPEND di akhir style.css. Class dipasang oleh dashboard-layout.js.
+   Semua selector diawali #page-dashboard supaya menang atas aturan lama
+   tanpa perlu menghapusnya.
+
+   Keputusan:
+   - Section yang dipensiunkan hanya disembunyikan (display:none), id tetap
+     ada. Penghapusan HTML ditunda sampai semua iterasi selesai.
+   - Jarak antar section diatur satu tempat: #page-dashboard dijadikan kolom
+     dengan gap 24px, margin bawaan tiap section dinolkan. Jadi jaraknya
+     konsisten tanpa perlu tahu class tiap section.
+   - PORT PON : Beban CPU = 1fr : 2fr. Port dibuat grid 4x4 supaya tinggi
+     card PON hampir sama dengan chart tanpa menambah data baru.
+   - Tinggi tidak dipaksa lewat min-height halaman. Hanya dua card ini yang
+     punya tinggi minimum 380px.
+   ========================================================================== */
+
+#page-dashboard .is-retired { display: none !important; }
+
+/* ---- Ritme vertikal 24px ---- */
+#page-dashboard.active {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+#page-dashboard > * { margin-top: 0; margin-bottom: 0; }
+
+/* ---- Baris PORT PON + BEBAN CPU & MEMORY ---- */
+#page-dashboard .dash-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: var(--space-6);
+  align-items: stretch;
+}
+#page-dashboard .dash-pon   { grid-column: 1; }
+#page-dashboard .dash-chart { grid-column: 2; }
+
+#page-dashboard .dash-pon,
+#page-dashboard .dash-chart {
+  display: flex;
+  flex-direction: column;
+  min-height: 380px;
+  margin: 0;
+  padding: var(--space-6);
+}
+
+/* Port: 4 kolom, baris mengisi tinggi card */
+#page-dashboard .dash-ports {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: minmax(56px, 1fr);
+  gap: var(--space-2);
+  flex: 1;
+  margin-top: var(--space-4);
+}
+
+/* Chart: tinggi tetap 300px; Chart.js mengikuti lewat maintainAspectRatio:false */
+#page-dashboard .dash-chart-box {
+  position: relative;
+  height: 300px;
+  min-width: 0;
+  margin-top: var(--space-4);
+}
+
+@media (max-width: 1100px) {
+  #page-dashboard .dash-split { grid-template-columns: 1fr; }
+  #page-dashboard .dash-pon,
+  #page-dashboard .dash-chart { grid-column: auto; }
+  #page-dashboard .dash-pon { min-height: 0; }
+}

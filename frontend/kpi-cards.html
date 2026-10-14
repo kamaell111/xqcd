@@ -1,0 +1,69 @@
+<!-- ======================================================================
+     ITERASI 1 — 4 STAT CARD COMPACT
+     Gantikan blok <div class="widgets"> ... </div> yang berisi 4 stat card.
+     Bagian lain di dashboard TIDAK disentuh.
+
+     Dipertahankan persis:
+       id    : stat-online, stat-offline, stat-los, stat-alerts,
+               online-sub, offline-sub, los-sub, online-trend
+       onclick/onkeydown/role/tabindex di tiap card (navigasi + keyboard)
+     Yang berubah: class wrapper (widgets/widget/stat-card -> kpi-*) dan ikon
+     (Font Awesome solid -> SVG outline, supaya abu-abu tipis sesuai brief).
+     Warna angka TIDAK diberi class di sini: tetap diatur app.js seperti sekarang.
+     ====================================================================== -->
+<div class="kpi-grid">
+
+  <div class="kpi" role="button" tabindex="0" title="Lihat ONU online"
+       onclick="gotoFiltered('onus','online')"
+       onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoFiltered('onus','online')}">
+    <div class="kpi-main">
+      <div class="kpi-label">ONU online</div>
+      <div class="kpi-row">
+        <div class="kpi-value" id="stat-online"><span class="skeleton">--</span></div>
+        <div class="kpi-trend" id="online-trend"></div>
+        <div class="kpi-sub" id="online-sub">dari -- ONU</div>
+      </div>
+    </div>
+    <svg class="kpi-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>
+  </div>
+
+  <div class="kpi" role="button" tabindex="0" title="Lihat ONU offline"
+       onclick="gotoFiltered('onus','offline')"
+       onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoFiltered('onus','offline')}">
+    <div class="kpi-main">
+      <div class="kpi-label">ONU offline</div>
+      <div class="kpi-row">
+        <div class="kpi-value" id="stat-offline"><span class="skeleton">--</span></div>
+        <div class="kpi-sub" id="offline-sub">Modem mati atau tidak terhubung</div>
+      </div>
+    </div>
+    <svg class="kpi-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg>
+  </div>
+
+  <div class="kpi" role="button" tabindex="0" title="Lihat ONU LOS"
+       onclick="gotoFiltered('onus','los')"
+       onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoFiltered('onus','los')}">
+    <div class="kpi-main">
+      <div class="kpi-label">ONU LOS</div>
+      <div class="kpi-row">
+        <div class="kpi-value" id="stat-los"><span class="skeleton">--</span></div>
+        <div class="kpi-sub" id="los-sub">Sinyal hilang — cek fiber</div>
+      </div>
+    </div>
+    <svg class="kpi-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>
+  </div>
+
+  <div class="kpi" role="button" tabindex="0" title="Lihat alert"
+       onclick="gotoPage('alerts')"
+       onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoPage('alerts')}">
+    <div class="kpi-main">
+      <div class="kpi-label">Alert aktif</div>
+      <div class="kpi-row">
+        <div class="kpi-value" id="stat-alerts"><span class="skeleton">--</span></div>
+        <div class="kpi-sub" id="alert-sub">-</div>
+      </div>
+    </div>
+    <svg class="kpi-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+  </div>
+
+</div>

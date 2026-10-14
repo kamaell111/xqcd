@@ -1,0 +1,77 @@
+# =========================================================
+# OLT Manager — .gitignore (root, satu-satunya sumber kebenaran)
+# =========================================================
+
+# ---- Credentials & secrets ----
+.env
+.env.*
+!.env.example
+*.key
+.wa_fernet.key
+*.wa_fernet.key
+*.pem
+*.crt
+*.p12
+
+# ---- Databases ----
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backend/data/*.db
+backend/data/backups/
+
+# ---- Backup / junk files & folders ----
+*.bak
+*.bak*
+*.bak-*
+*.bak_*
+*.step*backup*
+*.orig
+backup/
+backup_*/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Virtualenv ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- Logs ----
+logs/*
+!logs/.gitkeep
+*.log
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Docker ----
+docker-compose.override.yml
+
+# ---- Frontend ----
+node_modules/
+frontend/dist/
+
+# ---- Jangan ignore file contoh ----
+!.env.example
+!**/.env.example

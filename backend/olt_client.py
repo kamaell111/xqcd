@@ -1,0 +1,362 @@
+"""OLT client untuk ZTE ZXAN — support Telnet & SSH via Netmiko."""
+from netmiko import ConnectHandler
+from olt_strict import StrictConfigMixin
+from typing import List, Dict
+import re
+import hashlib
+import time as _time
+import threading
+import atexit
+
+# ⚡ Connection cache — pakai 1 koneksi telnet untuk banyak request
+_CONN_CACHE = {}          # {key: (conn, last_used_time)}
+_CONN_LOCK = threading.Lock()
+_CONN_TTL = 240           # 4 menit
+
+
+class _CachedConn:
+    """Wrapper: disconnect() jadi no-op biar koneksi tetap hidup untuk request berikutnya.
+
+    _cmd_lock di-share via connection object (bukan per wrapper) supaya
+    semua _CachedConn yang wrap koneksi fisik yang sama pakai lock yang SAMA.
+    """
+    def __init__(self, conn, key):
+        self._conn = conn
+        self._key = key
+        # Ambil / buat _cmd_lock di connection asli (shared antar wrapper)
+        if not hasattr(conn, "_olut_cmd_lock"):
+            conn._olut_cmd_lock = threading.Lock()
+        self._cmd_lock = conn._olut_cmd_lock
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def send_command_timing(self, *args, **kwargs):
+        with self._cmd_lock:
+            return self._conn.send_command_timing(*args, **kwargs)
+
+    def send_command(self, *args, **kwargs):
+        with self._cmd_lock:
+            return self._conn.send_command(*args, **kwargs)
+
+    def disconnect(self):
+        # Update timestamp saja, JANGAN tutup koneksi
+        with _CONN_LOCK:
+            if self._key in _CONN_CACHE:
+                _CONN_CACHE[self._key] = (self._conn, _time.time())
+
+
+def _cleanup_all():
+    with _CONN_LOCK:
+        for key, (conn, _) in list(_CONN_CACHE.items()):
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+        _CONN_CACHE.clear()
+
+atexit.register(_cleanup_all)
+
+
+def _pw_hash(password: str) -> str:
+    """Short hash password untuk cache key — biar beda password = beda entry."""
+    if not password:
+        return "nopass"
+    return hashlib.sha256(password.encode()).hexdigest()[:16]
+
+
+def evict_connection(host: str, port: int, username: str = None):
+    """Tutup + buang koneksi cache untuk (host, port) atau (host, port, username).
+    Panggil setelah edit/hapus OLT supaya kredensial lama tidak dipakai lagi."""
+    with _CONN_LOCK:
+        to_remove = [
+            k for k in list(_CONN_CACHE.keys())
+            if k[0] == host and k[1] == port
+            and (username is None or k[2] == username)
+        ]
+        for key in to_remove:
+            try:
+                _CONN_CACHE[key][0].disconnect()
+            except Exception:
+                pass
+            _CONN_CACHE.pop(key, None)
+    return len(to_remove)
+
+
+def _get_or_create(host, port, username, password, enable_password, protocol, timeout,
+                   device_type, max_retries=3):
+    key = (host, port, username, _pw_hash(password))
+
+    # Try cache
+    with _CONN_LOCK:
+        entry = _CONN_CACHE.get(key)
+        if entry:
+            conn, last = entry
+            if _time.time() - last < _CONN_TTL:
+                try:
+                    if conn.is_alive():
+                        _CONN_CACHE[key] = (conn, _time.time())
+                        return _CachedConn(conn, key)
+                except Exception:
+                    pass
+            # Stale
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+            _CONN_CACHE.pop(key, None)
+
+    # Create new
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+        "timeout": timeout,
+        "conn_timeout": timeout,
+        "banner_timeout": timeout,        # batas tunggu banner awal
+        "session_timeout": 120,
+        "read_timeout_override": 60,      # batas baca output tiap command
+        "fast_cli": True,
+        "global_delay_factor": 1.0,
+    }
+    if enable_password:
+        params["secret"] = enable_password
+
+    # ⭐ Retry ConnectHandler dengan backoff
+    conn = None
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            conn = ConnectHandler(**params)
+            break
+        except Exception as e:
+            last_err = e
+            wait = 2 ** attempt
+            print(f"[OLT-CONNECT] {host}:{port} attempt {attempt+1}/{max_retries} gagal: {e}")
+            if attempt < max_retries - 1:
+                _time.sleep(wait)
+
+    if conn is None:
+        raise RuntimeError(f"Gagal connect ke {host}:{port} setelah {max_retries}x: {last_err}")
+
+    if enable_password:
+        try:
+            conn.enable()
+        except Exception:
+            pass
+
+    try:
+        conn.send_command_timing("terminal length 0", read_timeout=10, last_read=0.3)
+    except Exception:
+        pass
+
+    with _CONN_LOCK:
+        old = _CONN_CACHE.get(key)
+        if old:
+            try:
+                old[0].disconnect()
+            except Exception:
+                pass
+        _CONN_CACHE[key] = (conn, _time.time())
+
+    return _CachedConn(conn, key)
+
+
+# ⚡ Tuning: last_read=0.3 mempercepat 4x (dari 2.2s → 0.5s/command)
+# Gunakan LAST_READ_SHORT untuk output pendek, LAST_READ_LONG untuk output panjang
+LAST_READ_SHORT = 0.3
+LAST_READ_LONG = 1.0
+
+
+class OLTClient(StrictConfigMixin):
+    """
+    Client untuk OLT ZTE ZXAN (C320/C300/C620, dll).
+
+    Contoh Telnet:
+        OLTClient("10.0.0.1", "admin", "admin",
+                  enable_password="enablepass", port=23, protocol="telnet")
+    Contoh SSH:
+        OLTClient("10.0.0.2", "admin", "admin",
+                  enable_password="...", port=22, protocol="ssh")
+    """
+
+    def __init__(self, host, username, password,
+                 enable_password=None, port=23, protocol="telnet",
+                 timeout=30, fast_test=False):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.enable_password = enable_password
+        self.port = port
+        self.protocol = (protocol or "telnet").lower()
+        self.timeout = timeout
+        self.fast_test = fast_test
+
+    # ---------- internal ----------
+    def _device_type(self) -> str:
+        return "zte_zxros" if self.protocol == "ssh" else "zte_zxros_telnet"
+
+    def _connect(self):
+        """Ambil koneksi dari cache atau buat baru."""
+        # fast_test: retry 1x saja + timeout lebih pendek (untuk Test Connection UI)
+        if self.fast_test:
+            return _get_or_create(
+                self.host, self.port, self.username, self.password,
+                self.enable_password, self.protocol, min(self.timeout, 15),
+                self._device_type(), max_retries=1,
+            )
+        return _get_or_create(
+            self.host, self.port, self.username, self.password,
+            self.enable_password, self.protocol, self.timeout,
+            self._device_type(),
+        )
+
+    # ---------- public API ----------
+    def test_connection(self) -> Dict:
+        """Tes koneksi + ambil 'show version'. Return dict."""
+        try:
+            conn = self._connect()
+            try:
+                out = conn.send_command_timing("show system-group", read_timeout=20, last_read=LAST_READ_LONG)
+                return {"ok": True, "output": out}
+            finally:
+                conn.disconnect()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def run_commands(self, commands: List[str]) -> str:
+        """Kirim command mode non-config (show/display)."""
+        conn = self._connect()
+        try:
+            return conn.send_command_timing(
+                "\n".join(commands), read_timeout=60, last_read=LAST_READ_LONG
+            )
+        finally:
+            conn.disconnect()
+
+    def run_config(self, commands: List[str], save: bool = False) -> str:
+        """Kirim command config satu per satu pakai send_command_timing.
+        Lebih reliable untuk ZTE ZXAN via Telnet (prompt detection sering timeout)."""
+        conn = self._connect()
+        try:
+            output_lines = []
+            for raw_cmd in commands:
+                cmd = raw_cmd.strip()   # <-- strip leading/trailing spaces
+                if not cmd:
+                    continue
+
+                # ⭐ Handle delay marker
+                if cmd == "__DELAY_3S__":
+                    import time as _t
+                    _t.sleep(3)
+                    output_lines.append(">>> __DELAY_3S__ (3 detik)")
+                    continue
+                try:
+                    out = conn.send_command_timing(
+                        cmd,
+                        read_timeout=30,
+                        last_read=LAST_READ_SHORT,
+                        strip_prompt=False,
+                        strip_command=False,
+                    )
+                    output_lines.append(f">>> {cmd}")
+                    output_lines.append(out)
+                    # Kalau ada error, log
+                    if any(k in out for k in ("Error", "Invalid", "Incomplete", "unknown ME", "Ambiguous")):
+                        output_lines.append(f"    [WARN] command mungkin gagal")
+                except Exception as e:
+                    output_lines.append(f">>> {cmd}")
+                    output_lines.append(f"    [ERROR] {e}")
+
+            if save:
+                try:
+                    out = conn.send_command_timing(
+                        "write", read_timeout=60, last_read=LAST_READ_LONG,
+                        strip_prompt=False, strip_command=False,
+                    )
+                    output_lines.append(">>> write")
+                    output_lines.append(out)
+                except Exception as e:
+                    output_lines.append(f"[SAVE ERROR] {e}")
+
+            return "\n".join(output_lines)
+        finally:
+            conn.disconnect()
+
+    def commit_config(self) -> str:
+        """Kirim `write` untuk simpan running-config ke startup-config.
+        Dipakai oleh two-phase commit (operasi destruktif)."""
+        conn = self._connect()
+        try:
+            out = conn.send_command_timing(
+                "write", read_timeout=60, last_read=LAST_READ_LONG,
+                strip_prompt=False, strip_command=False,
+            )
+            return out
+        finally:
+            conn.disconnect()
+
+    def get_running_config(self) -> str:
+        conn = self._connect()
+        try:
+            return conn.send_command(
+                "show running-config", read_timeout=120
+            )
+        finally:
+            conn.disconnect()
+
+    # ---------- validasi ----------
+    _BLACKLIST = re.compile(
+        r"^\s*("
+        r"reload|reboot|erase|format|delete|"
+        r"factory-reset|restore|clear\s+startup|"
+        r"ip\s+route|no\s+ip\s+route|"
+        r"interface\s+mng\b|no\s+interface\s+mng\b|"
+        r"no\s+interface\s+gpon-onu"
+        r")",
+        re.IGNORECASE,
+    )
+
+    _ALLOWED = re.compile(
+        r"^\s*("
+        r"configure|config|interface|exit|end|no\s|undo\s|"
+        r"onu|gpon|pon|epon|gpon-olt|gpon-onu|pon-onu-mng|"
+        r"tcont|gemport|service-port|vport|sn-bind|name|"
+        r"profile|onu-type|add-card|add-rack|add-shelf|add-subcard|"
+        r"uncfg-onu-display-info|onu-pnp|"
+        r"pppoe|wan|iphost|firewall|security-mgmt|"
+        r"ip\s|iphost|dhcp|"
+        r"switchport|hybrid-attribute|negotiation|speed|duplex|"
+        r"flowcontrol|linktrap|shutdown|port-protect|uplink-isolate|"
+        r"description|mtu|tag-mode|phy-attribute|"
+        r"vlan|vlan-reserve|"
+        r"hostname|username|snmp-server|logging|clock|"
+        r"service\s|line\s|banner|message-of-day|"
+        r"config-filename|set-pnp|operator-mode|"
+        r"ip\s+route|static-route|"
+        r"write|save"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    def validate_commands(self, commands: List[str]) -> Dict:
+        errors = []
+        for raw in commands:
+            c = raw.strip()
+            if not c or c.startswith("!") or c.startswith("#"):
+                continue
+            # ⭐ Skip marker internal (delay, dsb)
+            if c.startswith("__") and c.endswith("__"):
+                continue
+            if self._BLACKLIST.match(c):
+                errors.append(f"Command dilarang (berbahaya): {c}")
+                continue
+            if not self._ALLOWED.match(c):
+                errors.append(f"Command tidak dikenali: {c}")
+        return {"valid": len(errors) == 0, "errors": errors}
+
+
+# Backward-compat
+ZXANClient = OLTClient

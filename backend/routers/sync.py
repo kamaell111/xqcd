@@ -1,0 +1,1140 @@
+import asyncio
+"""Sync data real dari OLT ZXAN → DB."""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from datetime import datetime
+import re
+
+from database import get_db
+from models import OLT, User, MetricHistory, BoardMetric
+from auth import get_current_user, audit
+from olt_client import OLTClient
+from olt_manager import olt_locked
+from tenancy import require_olt_access
+from olt_client import LAST_READ_SHORT, LAST_READ_LONG
+from alerting import check_olt_resource_alerts, check_onu_alerts
+from config import settings
+from olt_snmp import OltSnmpClient
+
+
+# =================== CACHE ===================
+import time as _time_mod
+import threading as _threading
+
+_RUNNING_CFG_CACHE = {}    # {olt_id: (raw, ts)}
+_ONU_STATE_CACHE = {}      # {olt_id: (raw, ts)}
+_UNCFG_CACHE = {}          # {olt_id: (raw, ts)}
+_OPTICAL_BULK_CACHE = {}   # {olt_id: ({onu_index: {...}}, ts)}
+_DETAIL_CACHE = {}         # {(olt_id, onu_index): (data, ts)}
+_CACHE_LOCK = _threading.Lock()
+
+# Auto-detect SNMP: kalau baru gagal < X detik, skip biar tidak buang timeout
+_SNMP_UNREACHABLE = {}     # {olt_id: ts_last_fail}
+
+_CACHE_TTL_RUNNING = 300   # 5 menit
+_CACHE_TTL_STATE = 30      # 30 detik
+_CACHE_TTL_UNCFG = 30      # 30 detik
+_CACHE_TTL_OPTICAL_BULK = settings.OPTICAL_CACHE_TTL_S   # dari env
+_CACHE_TTL_DETAIL = settings.DETAIL_CACHE_TTL_S   # dari env
+_MAX_DETAIL_QUERIES_PER_CYCLE = 30   # budget stagger
+_SNMP_RETRY_AFTER = 300         # 5 menit
+
+
+def invalidate_olt_cache(olt_id: int):
+    """Hapus semua cache untuk OLT tertentu. Dipanggil setelah write OLT."""
+    with _CACHE_LOCK:
+        _RUNNING_CFG_CACHE.pop(olt_id, None)
+        _ONU_STATE_CACHE.pop(olt_id, None)
+        _UNCFG_CACHE.pop(olt_id, None)
+        _OPTICAL_BULK_CACHE.pop(olt_id, None)
+        # Detail cache per (olt_id, onu_index)
+        stale_keys = [k for k in _DETAIL_CACHE.keys() if k[0] == olt_id]
+        for k in stale_keys:
+            _DETAIL_CACHE.pop(k, None)
+    print(f"[CACHE] invalidate olt_id={olt_id}")
+
+
+def _cache_get(cache: dict, olt_id: int, ttl: int):
+    """Return value kalau masih fresh, None kalau expired."""
+    with _CACHE_LOCK:
+        entry = cache.get(olt_id)
+    if not entry:
+        return None
+    raw, ts = entry
+    if _time_mod.time() - ts > ttl:
+        return None
+    return raw
+
+
+def _cache_set(cache: dict, olt_id: int, raw: str):
+    with _CACHE_LOCK:
+        cache[olt_id] = (raw, _time_mod.time())
+
+
+router = APIRouter(prefix="/api/v1/olts", tags=["sync"])
+
+
+_BOARD_FIELDS = ("board_type", "serial", "cpu_5s", "cpu_avg",
+                 "cpu_alarm_threshold", "mem_pct", "mem_alarm_threshold",
+                 "phymem_mb", "firmware", "uptime_hex", "is_control")
+
+
+def _run_async(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _slot1_scalar(boards: dict, field: str):
+    """Slot 1 (konsisten _parse_processor existing), fallback slot terkecil."""
+    board = boards.get(1)
+    if board is None and boards:
+        board = boards[min(boards)]
+    return board.get(field) if board else None
+
+
+def _apply_snmp_boards(db, olt, boards: dict) -> bool:
+    """Tulis board_metrics + update OLT.cpu_usage/memory_usage dari SNMP."""
+    if not boards:
+        return False
+    cpu = _slot1_scalar(boards, "cpu_avg")
+    mem = _slot1_scalar(boards, "mem_pct")
+    if cpu is None or mem is None:
+        return False
+    now = datetime.utcnow()
+    existing = {m.slot: m for m in
+                db.query(BoardMetric).filter(BoardMetric.olt_id == olt.id)}
+    for slot, b in boards.items():
+        m = existing.pop(slot, None) or BoardMetric(olt_id=olt.id, slot=slot)
+        for f in _BOARD_FIELDS:
+            setattr(m, f, b.get(f))
+        m.source, m.updated_at = "snmp", now
+        db.add(m)
+    for stale in existing.values():
+        db.delete(stale)
+    olt.cpu_usage = cpu
+    olt.memory_usage = mem
+    return True
+
+
+def _make_client(olt: OLT) -> OLTClient:
+    return OLTClient(
+        host=olt.ip_address,
+        username=olt.username,
+        password=olt.password,
+        enable_password=olt.enable_password,
+        port=olt.port,
+        protocol=olt.protocol,
+    )
+
+
+def _parse_uptime(text: str) -> int:
+    """Parse '0 days, 9 hours, 4 minutes' → detik."""
+    d = re.search(r"(\d+)\s+day", text)
+    h = re.search(r"(\d+)\s+hour", text)
+    m = re.search(r"(\d+)\s+minute", text)
+    return (int(d.group(1)) if d else 0) * 86400 \
+         + (int(h.group(1)) if h else 0) * 3600 \
+         + (int(m.group(1)) if m else 0) * 60
+
+
+def _parse_processor(output: str):
+    """Parse 'show processor' → cpu_usage, memory_usage (max antar card)."""
+    start = False
+    cards = []
+    for line in output.splitlines():
+        if "---" in line:
+            start = True
+            continue
+        if not start:
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        try:
+            cards.append({
+                "rack": int(parts[0]),
+                "shelf": int(parts[1]),
+                "slot": int(parts[2]),
+                "cpu_5s": float(parts[3].rstrip("%")),
+                "cpu_1m": float(parts[4].rstrip("%")),
+                "cpu_5m": float(parts[5].rstrip("%")),
+                "physmem_mb": int(parts[6]),
+                "memory": float(parts[7].rstrip("%")),
+            })
+        except (ValueError, IndexError):
+            continue
+    if not cards:
+        return None
+    # Ambil card slot 1 saja (card GPON/utama) — konsisten dengan dashboard
+    main = next((c for c in cards if c["slot"] == 1), cards[0])
+    return {
+        "cpu_usage": main["cpu_5m"],
+        "memory_usage": main["memory"],
+        "cards": cards,
+    }
+
+
+def _parse_system_group(output: str):
+    """Parse 'show system-group' → hostname, uptime, model, firmware, location."""
+    r = {"hostname": None, "uptime_seconds": None,
+         "model": None, "firmware": None, "location": None}
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("System Description:"):
+            m = re.search(r"(\S+)\s+Version\s+(\S+)", line)
+            if m:
+                r["model"] = m.group(1)
+                r["firmware"] = m.group(2)
+        elif line.startswith("Started before:"):
+            r["uptime_seconds"] = _parse_uptime(line)
+        elif line.startswith("System name:"):
+            r["hostname"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Location:"):
+            r["location"] = line.split(":", 1)[1].strip()
+    return r
+
+
+@router.post("/{olt_id}/sync")
+@olt_locked
+def sync_olt(db: Session = Depends(get_db),
+             olt: OLT = Depends(require_olt_access),
+             user: User = Depends(get_current_user)):
+    board_ok = False
+    if settings.SNMP_BOARD_PRIORITY:
+        snmp = None
+        loop = None
+        try:
+            snmp = OltSnmpClient(olt.ip_address, olt.snmp_community_ro,
+                                 port=olt.snmp_port or 161)
+            loop = asyncio.new_event_loop()
+            boards = loop.run_until_complete(snmp.get_board_status())
+            board_ok = _apply_snmp_boards(db, olt, boards)
+            if board_ok:
+                print(f"[SNMP-BOARD] sync_olt {olt.id}: {len(boards)} board via SNMP")
+        except Exception as e:
+            print(f"[SNMP-BOARD] sync_olt {olt.id} error: {type(e).__name__}")
+        finally:
+            if snmp is not None and loop is not None:
+                try:
+                    loop.run_until_complete(snmp.close())
+                except Exception:
+                    pass
+            if loop is not None:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+    if board_ok:
+        olt.status = "online"
+        olt.last_polled = datetime.utcnow()
+        db.commit()
+        db.refresh(olt)
+        audit(db, user.username, "sync_olt", str(olt.id))
+        return {
+            "ok": True,
+            "source": "snmp",
+            "olt": {
+                "hostname": olt.hostname,
+                "model": olt.model,
+                "firmware": olt.firmware,
+                "location": olt.location,
+                "cpu_usage": olt.cpu_usage,
+                "memory_usage": olt.memory_usage,
+                "uptime_seconds": olt.uptime_seconds,
+                "status": olt.status,
+                "last_polled": olt.last_polled,
+            },
+            "raw": {"processor": "", "system_group": ""},
+        }
+
+    client = _make_client(olt)
+    try:
+        conn = client._connect()
+        try:
+            proc_out = conn.send_command_timing("show processor", read_timeout=30, last_read=LAST_READ_LONG)
+            sys_out = conn.send_command_timing("show system-group", read_timeout=30, last_read=LAST_READ_LONG)
+        finally:
+            conn.disconnect()
+    except Exception as e:
+        olt.status = "offline"
+        db.commit()
+        audit(db, user.username, "sync_olt", str(olt.id), str(e), "failed")
+        raise HTTPException(500, f"Gagal sync: {e}")
+
+    proc = _parse_processor(proc_out)
+    sysinfo = _parse_system_group(sys_out)
+
+    if proc:
+        olt.cpu_usage = proc["cpu_usage"]
+        olt.memory_usage = proc["memory_usage"]
+        # Simpan ke history untuk chart
+        now = datetime.utcnow()
+        db.add(MetricHistory(olt_id=olt_id, metric="cpu",
+                             value=proc["cpu_usage"], ts=now))
+        db.add(MetricHistory(olt_id=olt_id, metric="memory",
+                             value=proc["memory_usage"], ts=now))
+    if sysinfo:
+        if sysinfo["hostname"]:
+            olt.hostname = sysinfo["hostname"]
+        if sysinfo["uptime_seconds"] is not None:
+            olt.uptime_seconds = sysinfo["uptime_seconds"]
+        if sysinfo["model"]:
+            olt.model = sysinfo["model"]
+        if sysinfo["firmware"]:
+            olt.firmware = sysinfo["firmware"]
+        if sysinfo["location"]:
+            olt.location = sysinfo["location"]
+
+    olt.status = "online"
+    olt.last_polled = datetime.utcnow()
+    db.commit()
+    db.refresh(olt)
+
+    audit(db, user.username, "sync_olt", str(olt_id))
+
+    return {
+        "ok": True,
+        "olt": {
+            "hostname": olt.hostname,
+            "model": olt.model,
+            "firmware": olt.firmware,
+            "location": olt.location,
+            "cpu_usage": olt.cpu_usage,
+            "memory_usage": olt.memory_usage,
+            "uptime_seconds": olt.uptime_seconds,
+            "status": olt.status,
+            "last_polled": olt.last_polled,
+        },
+        "raw": {
+            "processor": proc_out,
+            "system_group": sys_out,
+        },
+    }
+
+
+# ============================================================
+# SYNC PON & ONU
+# ============================================================
+
+def _parse_olt_interface(output: str) -> dict:
+    """Parse 'show interface gpon-olt_1/1/X' → status, onu count."""
+    r = {"status": "down", "onu_registered": 0, "onu_max": 0, "description": None}
+    for line in output.splitlines():
+        line = line.strip()
+        if "is activate" in line and "line protocol is up" in line:
+            r["status"] = "up"
+        elif "is activate" in line and "line protocol is down" in line:
+            r["status"] = "down"
+        elif "Description is" in line:
+            r["description"] = line.split("is", 1)[1].strip().rstrip(".")
+        elif "number of registered onus is" in line:
+            import re as _re
+            m = _re.search(r"number of registered onus is (\d+)", line)
+            if m:
+                r["onu_registered"] = int(m.group(1))
+            m2 = _re.search(r"has (\d+) onus", line)
+            if m2:
+                r["onu_max"] = int(m2.group(1))
+    return r
+
+
+def _parse_onu_state(output: str) -> list:
+    """Parse 'show gpon onu state' → list semua ONU aktif."""
+    onus = []
+    started = False
+    for line in output.splitlines():
+        if "---" in line:
+            started = True
+            continue
+        if not started or not line.strip():
+            continue
+        if line.startswith("ONU Number:"):
+            break
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        # Format: 1/1/1:1   enable   enable   working   1(GPON)
+        idx = parts[0]           # 1/1/1:1
+        try:
+            pon_and_id = idx.split(":")
+            pon = pon_and_id[0]      # 1/1/1
+            onu_id = int(pon_and_id[1])
+        except (ValueError, IndexError):
+            continue
+        onus.append({
+            "onu_index": idx,
+            "pon_port": pon,
+            "onu_id": onu_id,
+            "admin_state": parts[1],
+            "omcc_state": parts[2],
+            "phase_state": parts[3],
+            "channel": parts[4] if len(parts) > 4 else "",
+        })
+    return onus
+
+
+def _parse_onu_uncfg(output: str) -> list:
+    """Parse 'show gpon onu uncfg' → list ONU belum terdaftar."""
+    uncfg = []
+    started = False
+    for line in output.splitlines():
+        if "---" in line:
+            started = True
+            continue
+        if not started or not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        idx = parts[0]
+        sn = parts[1]
+        state = parts[2]
+        # Vendor dari prefix SN
+        vendor = "Unknown"
+        if sn.startswith("HWTC"):
+            vendor = "Huawei"
+        elif sn.startswith("ZTEG") or sn.startswith("YYKC"):
+            vendor = "ZTE"
+        elif sn.startswith("FHTT"):
+            vendor = "Fiberhome"
+        uncfg.append({
+            "onu_index": idx,
+            "serial_number": sn,
+            "state": state,
+            "vendor": vendor,
+        })
+    return uncfg
+
+
+def _parse_gpon_ports_from_config(running_config: str) -> dict:
+    """Parse admin state gpon-olt_1/1/X dari running-config."""
+    ports = {}
+    current = None
+    for line in running_config.splitlines():
+        stripped = line.strip()
+        m = __import__("re").match(r"^interface gpon-olt_(1/1/\d+)$", stripped)
+        if m:
+            current = m.group(1)
+            ports[current] = {"admin_state": "shutdown"}
+            continue
+        if current and stripped == "no shutdown":
+            ports[current]["admin_state"] = "no shutdown"
+        if current and stripped == "!":
+            current = None
+    return ports
+
+
+def _parse_remote_pppoe(output: str) -> dict:
+    """Parse 'show gpon remote-onu pppoe gpon-onu_X' → status + duration.
+    Return: {"status": "connected|disconnected|connecting|unknown",
+             "online_duration": int (detik),
+             "username": str, "nat": str}"""
+    import re as _re
+    r = {"status": "unknown", "online_duration": 0, "username": None, "nat": None}
+    for line in output.splitlines():
+        s = line.strip()
+        m = _re.match(r"Status:\s+(\S+)", s)
+        if m:
+            r["status"] = m.group(1).lower()
+            continue
+        m = _re.match(r"Online duration:\s+(\d+)", s)
+        if m:
+            r["online_duration"] = int(m.group(1))
+            continue
+        m = _re.match(r"Username:\s+(\S+)", s)
+        if m:
+            r["username"] = m.group(1)
+            continue
+        m = _re.match(r"NAT:\s+(\S+)", s)
+        if m:
+            r["nat"] = m.group(1)
+    return r
+
+
+def _parse_onu_config_from_running(running: str) -> dict:
+    """Parse blok config ONU dari running-config → dict per onu_index.
+
+    Return: {onu_index: {name, sn, type, tcont, gemport, service_port,
+                          user_vlan, vlan, pppoe_user, pppoe_nat}}
+    """
+    import re as _re
+    result = {}
+
+    # 1. Parse "onu X type F609 sn YYY" dari interface gpon-olt_*  → SN & type
+    sn_map = {}   # {(pon, onu_id): {sn, type}}
+    current_olt = None
+    for line in running.splitlines():
+        s = line.strip()
+        m = _re.match(r"^interface gpon-olt_(1/1/\d+)$", s)
+        if m:
+            current_olt = m.group(1)
+            continue
+        if s == "!":
+            current_olt = None
+            continue
+        if current_olt:
+            m2 = _re.match(r"^onu (\d+) type (\S+) sn (\S+)", s)
+            if m2:
+                sn_map[(current_olt, int(m2.group(1)))] = {
+                    "type": m2.group(2),
+                    "sn": m2.group(3),
+                }
+
+    # 2. Parse "interface gpon-onu_X:Y" + "pon-onu-mng gpon-onu_X:Y"
+    current = None
+    current_type = None
+    for line in running.splitlines():
+        s = line.strip()
+        m = _re.match(r"^interface gpon-onu_(1/1/\d+):(\d+)$", s)
+        if m:
+            current = f"{m.group(1)}:{m.group(2)}"
+            current_type = "interface"
+            result.setdefault(current, {"pon": m.group(1), "onu_id": int(m.group(2))})
+            continue
+        m = _re.match(r"^pon-onu-mng gpon-onu_(1/1/\d+):(\d+)$", s)
+        if m:
+            current = f"{m.group(1)}:{m.group(2)}"
+            current_type = "pon-onu-mng"
+            result.setdefault(current, {"pon": m.group(1), "onu_id": int(m.group(2))})
+            continue
+        if s == "!":
+            current = None
+            current_type = None
+            continue
+        if not current:
+            continue
+
+        d = result[current]
+        if current_type == "interface":
+            m2 = _re.match(r"^name (.+)$", s)
+            if m2: d["name"] = m2.group(1).strip()
+            m2 = _re.match(r"^tcont (\d+) name (\S+) profile (\S+)", s)
+            if m2: d["tcont"] = m2.group(3)
+            m2 = _re.match(r"^gemport (\d+) tcont", s)
+            if m2: d["gemport"] = int(m2.group(1))
+            m2 = _re.match(r"^service-port (\d+) vport (\d+) user-vlan (\d+) vlan (\d+)", s)
+            if m2:
+                d["service_port"] = int(m2.group(1))
+                d["vport"] = int(m2.group(2))
+                d["user_vlan"] = int(m2.group(3))
+                d["vlan"] = int(m2.group(4))
+        elif current_type == "pon-onu-mng":
+            m2 = _re.match(r"^pppoe (\d+) nat (\S+) user (\S+) password", s)
+            if m2:
+                d["pppoe_user"] = m2.group(3)
+                d["pppoe_nat"] = (m2.group(2) == "enable")
+
+    # 3. Merge SN & type dari langkah 1
+    for idx, d in result.items():
+        key = (d.get("pon"), d.get("onu_id"))
+        if key in sn_map:
+            d["sn"] = sn_map[key]["sn"]
+            d["type"] = sn_map[key]["type"]
+
+    return result
+
+
+def _parse_onu_detail(output: str) -> dict:
+    """Parse 'show gpon onu detail-info gpon-onu_X' → distance, online_duration."""
+    import re as _re
+    r = {"distance": None, "online_duration": 0}
+    for line in output.splitlines():
+        s = line.strip()
+        m = _re.match(r"ONU Distance:\s+(\d+)m", s)
+        if m:
+            r["distance"] = int(m.group(1))
+            continue
+        # "Online Duration: 11h 02m 44s"
+        m = _re.match(r"Online Duration:\s+(.+)", s)
+        if m:
+            dur_str = m.group(1).strip()
+            h = _re.search(r"(\d+)h", dur_str)
+            mm = _re.search(r"(\d+)m", dur_str)
+            sec = _re.search(r"(\d+)s", dur_str)
+            total = 0
+            if h: total += int(h.group(1)) * 3600
+            if mm: total += int(mm.group(1)) * 60
+            if sec: total += int(sec.group(1))
+            r["online_duration"] = total
+    return r
+
+
+def _parse_attenuation(output: str) -> dict:
+    """Parse 'show pon power attenuation gpon-onu_X' → optical + attenuation."""
+    r = {"olt_rx": None, "olt_tx": None, "onu_rx": None, "onu_tx": None,
+         "atten_up": None, "atten_down": None}
+    import re as _re
+    for line in output.splitlines():
+        # Baris up: up  Rx :-19.875(dbm)  Tx:2.158(dbm)  22.033(dB)
+        if line.strip().startswith("up "):
+            m = _re.search(r"Rx\s*:(-?[\d.]+)\(dbm\)", line)
+            if m: r["olt_rx"] = float(m.group(1))
+            m = _re.search(r"Tx\s*:(-?[\d.]+)\(dbm\)", line)
+            if m: r["onu_tx"] = float(m.group(1))
+            m = _re.search(r"(\d+\.\d+)\(dB\)", line)
+            if m: r["atten_up"] = float(m.group(1))
+        # Baris down: down  Tx :6.574(dbm)  Rx:-15.544(dbm)  22.118(dB)
+        elif line.strip().startswith("down "):
+            m = _re.search(r"Tx\s*:(-?[\d.]+)\(dbm\)", line)
+            if m: r["olt_tx"] = float(m.group(1))
+            m = _re.search(r"Rx\s*:(-?[\d.]+)\(dbm\)", line)
+            if m: r["onu_rx"] = float(m.group(1))
+            m = _re.search(r"(\d+\.\d+)\(dB\)", line)
+            if m: r["atten_down"] = float(m.group(1))
+    return r
+
+
+def _is_snmp_reachable(olt_id) -> bool:
+    """Auto-detect SNMP: return False kalau baru gagal < _SNMP_RETRY_AFTER detik."""
+    ts = _SNMP_UNREACHABLE.get(olt_id)
+    if ts is None:
+        return True
+    return (_time_mod.time() - ts) > _SNMP_RETRY_AFTER
+
+
+def _get_detail_cached(conn, olt_id, onu_idx, query_budget: list):
+    """Ambil detail ONU dari cache. Query ke OLT cuma kalau expired DAN budget masih ada.
+
+    query_budget adalah list [sisa_budget] — dimodifikasi di tempat.
+    Return: dict detail atau None.
+    """
+    key = (olt_id, onu_idx)
+    now = _time_mod.time()
+    entry = _DETAIL_CACHE.get(key)
+
+    if entry:
+        data, ts = entry
+        if (now - ts) < _CACHE_TTL_DETAIL:
+            return data  # fresh
+
+    # expired atau belum ada — cek budget
+    if query_budget[0] <= 0:
+        return entry[0] if entry else None   # pakai stale, jangan query
+
+    try:
+        det_cmd = f"show gpon onu detail-info gpon-onu_{onu_idx}"
+        det_out = conn.send_command_timing(det_cmd, read_timeout=30, last_read=LAST_READ_LONG)
+        data = _parse_onu_detail(det_out)
+        _DETAIL_CACHE[key] = (data, now)
+        query_budget[0] -= 1
+        return data
+    except Exception as e:
+        print(f"[DETAIL] {onu_idx} error: {e}")
+        return entry[0] if entry else None
+
+
+def _fetch_bulk_optical(conn, olt_id, active_pons):
+    """Ambil optical bulk per PON. Return {onu_index: {"onu_rx": float, "onu_tx": float}}."""
+    from zxan_parser import parse_pon_power_onu_rx, parse_pon_power_onu_tx
+
+    cached = _cache_get(_OPTICAL_BULK_CACHE, olt_id, _CACHE_TTL_OPTICAL_BULK)
+    if cached is not None:
+        print(f"[CACHE] optical-bulk HIT (olt_id={olt_id})")
+        return cached
+
+    result = {}
+    for pon in active_pons:
+        try:
+            rx_out = conn.send_command_timing(
+                f"show pon power onu-rx {pon}",
+                read_timeout=15, last_read=LAST_READ_SHORT,
+            )
+            for idx, val in parse_pon_power_onu_rx(rx_out).items():
+                result.setdefault(idx, {})["onu_rx"] = val
+        except Exception as e:
+            print(f"[OPTICAL-BULK] {pon} rx error: {e}")
+        try:
+            tx_out = conn.send_command_timing(
+                f"show pon power onu-tx {pon}",
+                read_timeout=15, last_read=LAST_READ_SHORT,
+            )
+            for idx, val in parse_pon_power_onu_tx(tx_out).items():
+                result.setdefault(idx, {})["onu_tx"] = val
+        except Exception as e:
+            print(f"[OPTICAL-BULK] {pon} tx error: {e}")
+
+    _cache_set(_OPTICAL_BULK_CACHE, olt_id, result)
+    print(f"[OPTICAL-BULK] {len(result)} ONU dari {len(active_pons)} PON")
+    return result
+
+
+def _do_sync_pons(db: Session, olt: OLT) -> dict:
+    """Core sync PON + ONU — dipakai endpoint DAN scheduler.
+    Raise Exception kalau gagal. Caller yang handle commit + audit."""
+    from models import PONPort, ONU
+    from olt_manager import olt_manager
+    from olt_snmp import SNMP_TRUSTED_STATUS
+    olt_id = olt.id
+    client = _make_client(olt)
+    optical_map = {}    # {onu_index: {"rx": ..., "tx": ...}}
+    pppoe_map = {}      # {onu_index: {"status": ..., "online_duration": ..., "username": ...}}
+    detail_map = {}     # {onu_index: {"distance": ..., "online_duration": ...}}
+    try:
+        conn = client._connect()
+        try:
+            # 3 command dasar — cache-aware
+            running_cfg = _cache_get(_RUNNING_CFG_CACHE, olt_id, _CACHE_TTL_RUNNING)
+            if running_cfg:
+                print(f"[CACHE] running-config HIT (olt_id={olt_id})")
+            else:
+                running_cfg = conn.send_command_timing(
+                    "show running-config", read_timeout=60, last_read=LAST_READ_LONG)
+                _cache_set(_RUNNING_CFG_CACHE, olt_id, running_cfg)
+                print(f"[CACHE] running-config MISS — cached")
+
+            onu_state_out = _cache_get(_ONU_STATE_CACHE, olt_id, _CACHE_TTL_STATE)
+            if onu_state_out:
+                print(f"[CACHE] onu-state HIT (olt_id={olt_id})")
+            else:
+                onu_state_out = conn.send_command_timing(
+                    "show gpon onu state", read_timeout=30, last_read=LAST_READ_SHORT)
+                _cache_set(_ONU_STATE_CACHE, olt_id, onu_state_out)
+                print(f"[CACHE] onu-state MISS — cached")
+
+            uncfg_out = _cache_get(_UNCFG_CACHE, olt_id, _CACHE_TTL_UNCFG)
+            if uncfg_out:
+                print(f"[CACHE] uncfg HIT (olt_id={olt_id})")
+            else:
+                uncfg_out = conn.send_command_timing(
+                    "show gpon onu uncfg", read_timeout=30, last_read=LAST_READ_SHORT)
+                _cache_set(_UNCFG_CACHE, olt_id, uncfg_out)
+                print(f"[CACHE] uncfg MISS — cached")
+
+            # Ambil optical + pppoe status untuk setiap ONU
+            import re as _re2
+
+            # ⚡ Auto-detect SNMP — skip kalau baru gagal < _SNMP_RETRY_AFTER
+            snmp_data = {}
+            snmp_status_detail = {}
+            if olt.snmp_community_ro and _is_snmp_reachable(olt_id):
+                try:
+                    from olt_snmp import OltSnmpClient
+                    c = OltSnmpClient(olt.ip_address, olt.snmp_community_ro,
+                                      port=olt.snmp_port or 161)
+                    loop = asyncio.new_event_loop()
+                    try:
+                        snmp_onus = loop.run_until_complete(c.list_onus())
+                        try:
+                            snmp_status_detail = loop.run_until_complete(
+                                c.get_onu_status_detail())
+                        except Exception as _st_err:
+                            print(f"[SNMP-STATUS] gagal: {type(_st_err).__name__}")
+                            snmp_status_detail = {}
+                    finally:
+                        try:
+                            loop.run_until_complete(c.close())
+                        except Exception:
+                            pass
+                        loop.close()
+                    if snmp_onus:
+                        for so in snmp_onus:
+                            pon_num = 1 + (so.pon_idx - 268501248) // 256
+                            snmp_data[f"1/1/{pon_num}:{so.onu_id}"] = so
+                        print(f"[SNMP] {len(snmp_data)} ONU via SNMP")
+                        if snmp_status_detail:
+                            print(f"[SNMP-STATUS] {len(snmp_status_detail)} ONU detail via SNMP")
+                        _SNMP_UNREACHABLE.pop(olt_id, None)
+                    else:
+                        print(f"[SNMP] 0 ONU — tandai unreachable 5 menit")
+                        _SNMP_UNREACHABLE[olt_id] = _time_mod.time()
+                except Exception as e:
+                    print(f"[SNMP] gagal: {e} — tandai unreachable 5 menit")
+                    _SNMP_UNREACHABLE[olt_id] = _time_mod.time()
+            elif olt.snmp_community_ro:
+                print(f"[SNMP] skip — baru gagal < 5 menit, pakai Telnet")
+
+            # ⚡ Pre-parse state untuk tahu mana ONU online (skip PPPoE kalau offline)
+            _onu_state_pre = _parse_onu_state(onu_state_out)
+            _detail_budget = [_MAX_DETAIL_QUERIES_PER_CYCLE]
+
+            # ⚡ Bulk optical per-PON (1 perintah per PON, jauh lebih cepat dari per-ONU)
+            _pous_set = set()
+            for _o in _onu_state_pre:
+                _pp = _o.get("pon_port")
+                if _pp:
+                    _pous_set.add(f"gpon-olt_{_pp}")
+            optical_bulk = {}
+            if _pous_set:
+                optical_bulk = _fetch_bulk_optical(conn, olt_id, sorted(_pous_set))
+
+            # ⚡ Pre-fetch ONU rows dari DB untuk cek cache PPPoE
+            from models import ONU as _ONU
+            _onu_cache = {}
+            for _o in db.query(_ONU).filter(_ONU.olt_id == olt_id).all():
+                _key = f"{_o.pon_port}:{_o.onu_id}"
+                _onu_cache[_key] = _o
+            _pppoe_ttl = settings.PPPOE_CACHE_TTL_S   # dari env
+            online_idxs = set()
+            for _o in _onu_state_pre:
+                if (_o.get("phase_state") or "").lower().strip() == "working":
+                    online_idxs.add(_o["onu_index"])
+            print(f"[SYNC] {len(online_idxs)} ONU online dari {len(_onu_state_pre)} total")
+
+            for m in _re2.finditer(r"^\s*(\d+/\d+/\d+:\d+)\s+enable", onu_state_out, _re2.MULTILINE):
+                idx = m.group(1)
+                so = snmp_data.get(idx)
+
+                # Optical: prioritas SNMP → bulk Telnet → per-ONU fallback
+                if so is not None and so.rx_dbm is not None and -35.0 < so.rx_dbm < 5.0:
+                    optical_map[idx] = {"onu_rx": so.rx_dbm, "onu_tx": so.tx_dbm}
+                else:
+                    _bulk = optical_bulk.get(idx)
+                    if _bulk and (_bulk.get("onu_rx") is not None or _bulk.get("onu_tx") is not None):
+                        optical_map[idx] = {
+                            "onu_rx": _bulk.get("onu_rx"),
+                            "onu_tx": _bulk.get("onu_tx"),
+                        }
+                    else:
+                        try:
+                            att_cmd = f"show pon power attenuation gpon-onu_{idx}"
+                            att_out = conn.send_command_timing(att_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
+                            optical_map[idx] = _parse_attenuation(att_out)
+                        except Exception as e:
+                            print(f"[OPTICAL] {idx} error: {type(e).__name__}")
+                # PPPoE status — skip kalau ONU tidak online
+                if idx not in online_idxs:
+                    pppoe_map[idx] = {
+                        "status": "disconnected",
+                        "online_duration": 0,
+                        "username": None,
+                        "nat": None,
+                    }
+                else:
+                    # ⚡ Cache check — kalau < 60 detik lalu, pakai DB
+                    cached = _onu_cache.get(idx)
+                    now_utc = datetime.utcnow()
+                    use_cache = (
+                        cached is not None
+                        and cached.internet_checked_at is not None
+                        and (now_utc - cached.internet_checked_at).total_seconds() < _pppoe_ttl
+                        and cached.pppoe_status
+                        and cached.pppoe_status != "unknown"
+                    )
+
+                    if use_cache:
+                        age = (now_utc - cached.internet_checked_at).total_seconds()
+                        print(f"[PPPOE-CACHE] {idx} HIT (age={age:.0f}s)")
+                        pppoe_map[idx] = {
+                            "status": cached.pppoe_status,
+                            "online_duration": cached.pppoe_online_duration or 0,
+                            "username": cached.pppoe_user,
+                            "nat": "enable" if cached.pppoe_nat else None,
+                            "_from_cache": True,
+                        }
+                    else:
+                        _age = None
+                        if cached and cached.internet_checked_at:
+                            _age = (now_utc - cached.internet_checked_at).total_seconds()
+                        print(f"[PPPOE-CACHE] {idx} MISS (age={_age}, status={cached.pppoe_status if cached else 'no-row'})")
+                        try:
+                            pppoe_cmd = f"show gpon remote-onu pppoe gpon-onu_{idx}"
+                            pppoe_out = conn.send_command_timing(pppoe_cmd, read_timeout=15, last_read=LAST_READ_SHORT)
+                            if "Error" not in pppoe_out and "Invalid" not in pppoe_out:
+                                entry = _parse_remote_pppoe(pppoe_out)
+                                entry["_from_cache"] = False
+                                pppoe_map[idx] = entry
+                            else:
+                                print(f"[PPPOE] {idx} tidak support remote-onu pppoe")
+                        except Exception as e:
+                            print(f"[PPPOE] {idx} error: {e}")
+                # Detail: cache-aware, budget 30 per siklus
+                if so is not None and so.distance_m is not None:
+                    detail_map[idx] = {"distance": so.distance_m, "online_duration": None}
+                else:
+                    det = _get_detail_cached(conn, olt_id, idx, _detail_budget)
+                    if det:
+                        detail_map[idx] = det
+        finally:
+            conn.disconnect()
+    except Exception as e:
+        raise RuntimeError(f"Gagal sync PON: {e}") from e
+
+    # Parse admin state dari running-config
+    cfg_ports = _parse_gpon_ports_from_config(running_cfg)
+    port_infos = {}
+    for i in range(1, 17):
+        port_no = f"1/1/{i}"
+        admin = cfg_ports.get(port_no, {}).get("admin_state", "shutdown")
+        port_infos[port_no] = {
+            "status": "up" if admin == "no shutdown" else "down",
+            "admin_state": admin,
+        }
+
+    # Parse hasil
+    onus = _parse_onu_state(onu_state_out)
+    uncfg = _parse_onu_uncfg(uncfg_out)
+    cfg_onus = _parse_onu_config_from_running(running_cfg)   # ⭐ data lengkap dari running-config
+
+    # Hitung ONU per port
+    onu_count_per_port = {}
+    for o in onus:
+        onu_count_per_port[o["pon_port"]] = onu_count_per_port.get(o["pon_port"], 0) + 1
+
+    # Update / buat PONPort rows
+    for i in range(1, 17):
+        port_no = f"1/1/{i}"
+        info = port_infos.get(port_no, {})
+        pon = db.query(PONPort).filter(
+            PONPort.olt_id == olt_id, PONPort.port_no == port_no
+        ).first()
+        if not pon:
+            pon = PONPort(olt_id=olt_id, port_no=port_no)
+            db.add(pon)
+        pon.status = info.get("status", "down")
+        pon.admin_state = "no shutdown" if info.get("status") == "up" else "shutdown"
+        pon.onu_count = onu_count_per_port.get(port_no, 0)
+        pon.last_updated = datetime.utcnow()
+
+    # Update / buat ONU rows + ambil optical untuk tiap ONU
+    onu_by_key = {}
+    for o in onus:
+        key = (o["pon_port"], o["onu_id"])
+        onu = db.query(ONU).filter(
+            ONU.olt_id == olt_id,
+            ONU.pon_port == o["pon_port"],
+            ONU.onu_id == o["onu_id"],
+        ).first()
+        # Tentukan status berdasarkan phase_state dari OLT
+        phase = (o.get("phase_state") or "").lower().strip()
+        if phase == "working":
+            new_status = "online"
+        elif phase == "los":
+            new_status = "los"
+        elif phase == "dying-gasp":
+            new_status = "dying_gasp"
+        elif phase == "offline":
+            new_status = "offline"
+        elif phase in ("configuring", "initial"):
+            new_status = "configuring"
+        else:
+            new_status = "unknown"
+
+        # Fase 1c: SNMP priority untuk status verified (2=los, 3=losi->los, 4=online)
+        # Value lain (1,5,6,7,0,None) -> fallback Telnet (new_status existing)
+        if settings.SNMP_STATUS_PRIORITY and snmp_status_detail:
+            _snmp_st = snmp_status_detail.get(o["onu_id"]) or {}
+            _raw = _snmp_st.get("status_raw")
+            if _raw is not None:
+                _trusted = SNMP_TRUSTED_STATUS.get(int(_raw))
+                if _trusted:
+                    if _trusted != new_status:
+                        print(f"[SNMP-STATUS] mismatch ONU {o['onu_id']}: "
+                              f"snmp_raw={int(_raw)} snmp={_trusted} telnet={new_status}")
+                    new_status = _trusted
+
+        if not onu:
+            # ⭐ Sync boleh INSERT ONU baru (kalau tidak ada job provisioning aktif)
+            # Cek dulu ada job aktif untuk slot ini?
+            job_key = f"onu:{o['pon_port']}:{o['onu_id']}"
+            has_active_job = False
+            try:
+                for jid, job in list(olt_manager.jobs.items()):
+                    if job["status"] in ("queued", "running") and job.get("olt_id") == str(olt_id):
+                        # Cek apakah job ini untuk slot yang sama
+                        has_active_job = True
+                        break
+            except Exception:
+                pass
+
+            if has_active_job:
+                print(f"[SYNC] Skip insert ONU {o['pon_port']}:{o['onu_id']} — ada job aktif")
+                continue
+
+            print(f"[SYNC] Insert ONU baru: {o['pon_port']}:{o['onu_id']} (dari OLT)")
+            onu = ONU(
+                olt_id=olt_id,
+                pon_port=o["pon_port"],
+                onu_id=o["onu_id"],
+                interface_name=f"gpon-onu_{o['onu_index']}",
+                status=new_status,
+                updated_at=datetime.utcnow(),
+            )
+            db.add(onu)
+            db.flush()
+
+        # ONU sudah ada di DB — update status & data
+        if onu.status != new_status:
+            # ⭐ Catat event sebelum ubah status
+            from event_log import log_onu_event
+            log_onu_event(db, olt_id, onu, "status_change",
+                          old_value=onu.status, new_value=new_status)
+            onu.status = new_status
+            # ⭐ Kalau offline/LOS/dying_gasp → reset PPPoE juga
+            if new_status in ("offline", "los", "dying_gasp"):
+                onu.pppoe_status = "disconnected"
+                onu.pppoe_online_duration = 0
+            # Catat waktu dying_gasp untuk suppression alert offline
+            if new_status == "dying_gasp":
+                onu.last_dying_gasp = datetime.utcnow()
+        onu.updated_at = datetime.utcnow()
+
+        # Fase 1b: enrich dari SNMP status detail (additive, tidak override status)
+        _snmp_det = snmp_status_detail.get(o["onu_id"]) if snmp_status_detail else None
+        if _snmp_det:
+            if _snmp_det.get("status_raw") is not None:
+                onu.status_detail_raw = int(_snmp_det["status_raw"])
+            if _snmp_det.get("offline_reason_raw") is not None:
+                onu.offline_reason_raw = int(_snmp_det["offline_reason_raw"])
+            if _snmp_det.get("offline_reason_label"):
+                onu.offline_reason_label = _snmp_det["offline_reason_label"]
+            if _snmp_det.get("last_online") and onu.last_online != _snmp_det["last_online"]:
+                onu.last_online = _snmp_det["last_online"]
+            if _snmp_det.get("last_offline") and onu.last_offline != _snmp_det["last_offline"]:
+                onu.last_offline = _snmp_det["last_offline"]
+
+        # Pakai optical yang sudah diambil di koneksi utama
+        optical = optical_map.get(o["onu_index"])
+        if optical:
+            if optical["onu_rx"] is not None:
+                onu.optical_rx = optical["onu_rx"]
+            if optical["onu_tx"] is not None:
+                onu.optical_tx = optical["onu_tx"]
+
+        # Enrich dari running-config (SN, name, VLAN, service-port, dll)
+        cfg = cfg_onus.get(o["onu_index"])
+        if cfg:
+            if cfg.get("sn"):
+                onu.serial_number = cfg["sn"]
+            if cfg.get("type"):
+                onu.type = cfg["type"]
+            if cfg.get("name"):
+                onu.name = cfg["name"]
+            if cfg.get("tcont"):
+                onu.tcont = cfg["tcont"]
+            if cfg.get("gemport") is not None:
+                onu.gemport = cfg["gemport"]
+            if cfg.get("service_port") is not None:
+                onu.service_port = cfg["service_port"]
+            if cfg.get("user_vlan") is not None:
+                onu.user_vlan = cfg["user_vlan"]
+            if cfg.get("vlan") is not None:
+                onu.vlan = cfg["vlan"]
+            if cfg.get("pppoe_user"):
+                onu.pppoe_user = cfg["pppoe_user"]
+            if cfg.get("pppoe_nat") is not None:
+                onu.pppoe_nat = cfg["pppoe_nat"]
+
+        # Simpan distance dari detail-info
+        det = detail_map.get(o["onu_index"])
+        if det and det["distance"] is not None:
+            onu.distance = det["distance"]
+
+        # Simpan status PPPoE / internet
+        pppoe = pppoe_map.get(o["onu_index"])
+        if pppoe:
+            onu.pppoe_status = pppoe["status"]
+            onu.pppoe_online_duration = pppoe["online_duration"]
+            if pppoe.get("username"):
+                onu.pppoe_user = pppoe["username"]
+            if pppoe.get("nat") == "enable":
+                onu.pppoe_nat = True
+            # ⚡ Update internet_checked_at hanya kalau bukan dari cache
+            if not pppoe.get("_from_cache"):
+                onu.internet_checked_at = datetime.utcnow()
+        else:
+            onu.pppoe_status = "unknown"
+
+        # 🔔 AUTO-ALERT per-ONU (offline, pppoe down, optical low)
+        try:
+            check_onu_alerts(db, olt_id, onu)
+        except Exception as e:
+            print(f"[ALERT ONU] {onu.serial_number or onu.onu_id}: {e}")
+
+        onu_by_key[key] = onu
+
+    # === Ghost cleanup: ONU di DB yang TIDAK ada di OLT → HAPUS ===
+    active_keys = set()
+    for o in onus:
+        active_keys.add((o["pon_port"], o["onu_id"]))
+
+    all_db_onus = db.query(ONU).filter(ONU.olt_id == olt_id).all()
+    for db_onu in all_db_onus:
+        db_key = (db_onu.pon_port, db_onu.onu_id)
+        if db_key not in active_keys:
+            # Cek apakah ada job provisioning aktif untuk slot ini
+            has_job = False
+            try:
+                for jid, job in list(olt_manager.jobs.items()):
+                    if job["status"] in ("queued", "running"):
+                        has_job = True
+                        break
+            except Exception:
+                pass
+
+            if has_job:
+                # Sedang provisioning — jangan hapus, tunggu selesai
+                db_onu.status = "configuring"
+                continue
+
+            # ONU ghost → hapus dari DB
+            print(f"[SYNC] Hapus ghost ONU: {db_onu.pon_port}:{db_onu.onu_id} (tidak ada di OLT)")
+            db.delete(db_onu)
+
+    # === Fix 2: ONU di DB yang TIDAK muncul di OLT saat ini → mark offline ===
+    # (ONU hilang dari show gpon onu state = tidak terdaftar / mati total)
+    active_keys = set(onu_by_key.keys())   # key (pon_port, onu_id) yang aktif di OLT
+    all_db_onus = db.query(ONU).filter(ONU.olt_id == olt_id).all()
+    for db_onu in all_db_onus:
+        db_key = (db_onu.pon_port, db_onu.onu_id)
+        if db_key not in active_keys:
+            # ONU ini tidak muncul di OLT — mark offline
+            if db_onu.status != "offline":
+                print(f"[SYNC] ONU {db_onu.pon_port}:{db_onu.onu_id} tidak muncul di OLT → mark offline")
+                db_onu.status = "offline"
+                db_onu.updated_at = datetime.utcnow()
+                # Trigger alert
+                try:
+                    check_onu_alerts(db, olt_id, db_onu)
+                except Exception as e:
+                    print(f"[ALERT ONU] {db_onu.serial_number or db_onu.onu_id}: {e}")
+
+    olt.last_polled = datetime.utcnow()
+    olt.status = "online"
+
+    # 🔔 AUTO-ALERT resource OLT (CPU, memory)
+    try:
+        check_olt_resource_alerts(db, olt)
+    except Exception as e:
+        print(f"[ALERT OLT] {e}")
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "pons": [
+            {
+                "port_no": f"1/1/{i}",
+                "status": port_infos.get(f"1/1/{i}", {}).get("status", "down"),
+                "onu_count": onu_count_per_port.get(f"1/1/{i}", 0),
+            }
+            for i in range(1, 17)
+        ],
+        "onus": onus,
+        "unconfigured": uncfg,
+        "summary": {
+            "total_onu_aktif": len(onus),
+            "total_onu_uncfg": len(uncfg),
+            "pons_up": sum(1 for i in range(1, 17)
+                           if port_infos.get(f"1/1/{i}", {}).get("status") == "up"),
+        },
+    }
+
+@router.post("/{olt_id}/sync-pons")
+@olt_locked
+def sync_pons(db: Session = Depends(get_db),
+              olt: OLT = Depends(require_olt_access),
+              user: User = Depends(get_current_user)):
+    """Sync status 16 PON port + list ONU dari OLT (endpoint manual)."""
+    try:
+        result = _do_sync_pons(db, olt)
+        audit(db, user.username, "sync_pons", str(olt.id))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        audit(db, user.username, "sync_pons", str(olt.id), str(e), "failed")
+        raise HTTPException(500, f"Gagal sync PON: {e}")
