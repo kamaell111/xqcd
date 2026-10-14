@@ -75,3 +75,9 @@ frontend/dist/
 # ---- Jangan ignore file contoh ----
 !.env.example
 !**/.env.example
+
+# ---- Snapshot DB saat runtime (jangan commit) ----
+backend/data/*.db*
+backend/data/*.current-empty
+backend/data/*.db-wal
+backend/data/*.db-shm
