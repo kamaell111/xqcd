@@ -56,7 +56,8 @@ def get_recent_recoveries(since: float = 0,
 
 
 @router.post("/{alert_id}/ack")
-def ack_alert(alert: Alert = Depends(require_alert_access),
+def ack_alert(alert_id: int,
+              alert: Alert = Depends(require_alert_access),
               db: Session = Depends(get_db),
               user: User = Depends(get_current_user)):
     a = alert
@@ -69,7 +70,8 @@ def ack_alert(alert: Alert = Depends(require_alert_access),
 
 
 @router.post("/{alert_id}/resolve")
-def resolve_alert(alert: Alert = Depends(require_alert_access),
+def resolve_alert(alert_id: int,
+                  alert: Alert = Depends(require_alert_access),
                   db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
     a = alert
@@ -81,7 +83,8 @@ def resolve_alert(alert: Alert = Depends(require_alert_access),
 
 
 @router.delete("/{alert_id}")
-def delete_alert(alert: Alert = Depends(require_alert_access),
+def delete_alert(alert_id: int,
+                 alert: Alert = Depends(require_alert_access),
                  db: Session = Depends(get_db),
                  user: User = Depends(require_privilege(10))):
     """Hapus 1 alert."""

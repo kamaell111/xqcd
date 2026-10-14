@@ -199,7 +199,8 @@ def _parse_system_group(output: str):
 
 @router.post("/{olt_id}/sync")
 @olt_locked
-def sync_olt(db: Session = Depends(get_db),
+def sync_olt(olt_id: int,
+             db: Session = Depends(get_db),
              olt: OLT = Depends(require_olt_access),
              user: User = Depends(get_current_user)):
     board_ok = False
@@ -684,7 +685,7 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                 running_cfg = conn.send_command_timing(
                     "show running-config", read_timeout=60, last_read=LAST_READ_LONG)
                 _cache_set(_RUNNING_CFG_CACHE, olt_id, running_cfg)
-                print(f"[CACHE] running-config MISS — cached")
+                print("[CACHE] running-config MISS — cached")
 
             onu_state_out = _cache_get(_ONU_STATE_CACHE, olt_id, _CACHE_TTL_STATE)
             if onu_state_out:
@@ -693,7 +694,7 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                 onu_state_out = conn.send_command_timing(
                     "show gpon onu state", read_timeout=30, last_read=LAST_READ_SHORT)
                 _cache_set(_ONU_STATE_CACHE, olt_id, onu_state_out)
-                print(f"[CACHE] onu-state MISS — cached")
+                print("[CACHE] onu-state MISS — cached")
 
             uncfg_out = _cache_get(_UNCFG_CACHE, olt_id, _CACHE_TTL_UNCFG)
             if uncfg_out:
@@ -702,7 +703,7 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                 uncfg_out = conn.send_command_timing(
                     "show gpon onu uncfg", read_timeout=30, last_read=LAST_READ_SHORT)
                 _cache_set(_UNCFG_CACHE, olt_id, uncfg_out)
-                print(f"[CACHE] uncfg MISS — cached")
+                print("[CACHE] uncfg MISS — cached")
 
             # Ambil optical + pppoe status untuk setiap ONU
             import re as _re2
@@ -739,13 +740,13 @@ def _do_sync_pons(db: Session, olt: OLT) -> dict:
                             print(f"[SNMP-STATUS] {len(snmp_status_detail)} ONU detail via SNMP")
                         _SNMP_UNREACHABLE.pop(olt_id, None)
                     else:
-                        print(f"[SNMP] 0 ONU — tandai unreachable 5 menit")
+                        print("[SNMP] 0 ONU — tandai unreachable 5 menit")
                         _SNMP_UNREACHABLE[olt_id] = _time_mod.time()
                 except Exception as e:
                     print(f"[SNMP] gagal: {e} — tandai unreachable 5 menit")
                     _SNMP_UNREACHABLE[olt_id] = _time_mod.time()
             elif olt.snmp_community_ro:
-                print(f"[SNMP] skip — baru gagal < 5 menit, pakai Telnet")
+                print("[SNMP] skip — baru gagal < 5 menit, pakai Telnet")
 
             # ⚡ Pre-parse state untuk tahu mana ONU online (skip PPPoE kalau offline)
             _onu_state_pre = _parse_onu_state(onu_state_out)

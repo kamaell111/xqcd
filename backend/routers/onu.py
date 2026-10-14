@@ -423,7 +423,7 @@ def _run_provision_job(job_id: str, req_dict: dict, username: str):
             )
             print(f"[PROVISION] ONU {onu_index} — {warning_msg}")
         elif pppoe_status == "disconnected":
-            warning_msg = f"PPPoE disconnected — cek modem/kredensial"
+            warning_msg = "PPPoE disconnected — cek modem/kredensial"
         else:
             warning_msg = f"PPPoE status: {pppoe_status}"
 

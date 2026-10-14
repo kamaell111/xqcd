@@ -712,7 +712,7 @@ if __name__ == "__main__":
         up = await client.get_sys_uptime()
         print(f"  uptime: {up} detik ({up//86400 if up else '?'} hari)")
 
-        print(f"[TEST] Walk ONU list...")
+        print("[TEST] Walk ONU list...")
         onus = await client.list_onus()
         print(f"  Total ONU: {len(onus)}")
         for o in onus:

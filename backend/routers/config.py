@@ -85,7 +85,8 @@ def preview_config(req: ConfigPreviewRequest,
 
 @router.post("/{olt_id}/config/apply")
 @olt_locked
-def apply_config(req: ConfigApplyRequest,
+def apply_config(olt_id: int,
+                 req: ConfigApplyRequest,
                  db: Session = Depends(get_db),
                  olt: OLT = Depends(require_olt_access),
                  user: User = Depends(require_privilege(10))):
@@ -301,7 +302,7 @@ def _run_create_vlan_job(job_id: str, olt_id: int, req_dict: dict, username: str
 
 @router.post("/{olt_id}/vlans_legacy_disabled")
 @olt_locked
-def _legacy_create_vlan_disabled(req: VLANCreate, db: Session = Depends(get_db),
+def _legacy_create_vlan_disabled(olt_id: int, req: VLANCreate, db: Session = Depends(get_db),
                 olt: OLT = Depends(require_olt_access),
                 user: User = Depends(require_privilege(10))):
     if db.query(VLAN).filter(VLAN.olt_id == olt_id, VLAN.vlan_id == req.vlan_id).first():
