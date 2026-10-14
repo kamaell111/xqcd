@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          pip install -r backend/requirements.txt
+          pip install ruff pytest
+      - name: Lint
+        run: ruff check backend/
+      - name: Test
+        run: pytest backend/tests/
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if sensitive file patterns are tracked
+        run: |
+          if git ls-files | grep -E '\.env$|\.key$|\.db$|\.db-wal$|\.db-shm$|\.bak|current-empty|backup_'; then
+            echo "Sensitive file pattern found in tracked files!"
+            exit 1
+          fi
+          echo "Clean."
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (sanity check only, no push)
+        run: docker build -t olt-manager:ci-check .
