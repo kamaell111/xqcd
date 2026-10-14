@@ -57,8 +57,8 @@ class PackageIn(BaseModel):
     vport: StrictInt = 1
     user_vlan: StrictInt
     vlan: StrictInt
-    pppoe_user_pattern: str = ""      # opsional: kosong = tidak dikonfigurasi
-    pppoe_password_pattern: str = ""  # opsional: kosong = tidak dikonfigurasi
+    pppoe_user_pattern: Optional[str] = None      # None = belum diisi -> default model {SN}; "" = sengaja kosong
+    pppoe_password_pattern: Optional[str] = None  # None = belum diisi -> default model {RANDOM8}; "" = sengaja kosong
     pppoe_nat: StrictBool = True
     firewall_level: str = "low"
     security_mgmt_mode: str = "forward"
@@ -76,6 +76,17 @@ def _clean(body: PackageIn) -> dict:
     if not d["description"]:
         d["description"] = None
     return d
+
+
+def _model_kwargs(d: dict) -> dict:
+    """Filter None pattern values — biarkan SQLAlchemy column default apply.
+    "" eksplisit tetap diteruskan (opt-out non-OLT)."""
+    out = {}
+    for k, v in d.items():
+        if k in ("pppoe_user_pattern", "pppoe_password_pattern") and v is None:
+            continue
+        out[k] = v
+    return out
 
 
 def _check_pattern(label: str, v: str, errs: list) -> None:
@@ -228,7 +239,7 @@ def create_package(body: PackageIn,
     if _name_taken(db, olt.id, d["name"]):
         raise HTTPException(409, 'Paket "' + d["name"] + '" sudah ada di OLT ini')
     now = datetime.utcnow()
-    p = ServicePackage(olt_id=olt.id, created_at=now, updated_at=now, **d)
+    p = ServicePackage(olt_id=olt.id, created_at=now, updated_at=now, **_model_kwargs(d))
     db.add(p)
     _audit(db, user, "package.create", "olt=" + str(olt.id) + " paket=" + d["name"])
     try:
@@ -252,7 +263,7 @@ def update_package(pkg_id: int, body: PackageIn,
         raise HTTPException(422, " · ".join(errs))
     if _name_taken(db, olt.id, d["name"], except_id=p.id):
         raise HTTPException(409, 'Paket "' + d["name"] + '" sudah ada di OLT ini')
-    for k, v in d.items():
+    for k, v in _model_kwargs(d).items():
         setattr(p, k, v)
     p.updated_at = datetime.utcnow()
     _audit(db, user, "package.update", "olt=" + str(olt.id) + " paket=" + d["name"])

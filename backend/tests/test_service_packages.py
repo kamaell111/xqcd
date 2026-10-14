@@ -97,6 +97,30 @@ def test_create_ok_dan_default(env):
     assert env.client.get(url()).json()["items"][0]["name"] == "PAKET-100M"
 
 
+def test_create_pattern_eksplisit_kosong(env):
+    """Empty string eksplisit -> simpan kosong (opt-out non-OLT/Huawei)."""
+    p = payload()
+    p["pppoe_user_pattern"] = ""
+    p["pppoe_password_pattern"] = ""
+    r = env.client.post(url(), json=p)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["pppoe_user_pattern"] == ""
+    assert d["pppoe_password_pattern"] == ""
+
+
+def test_create_pattern_custom(env):
+    """Custom pattern -> simpan apa adanya."""
+    p = payload()
+    p["pppoe_user_pattern"] = "cust-{SN}-v2"
+    p["pppoe_password_pattern"] = "{RANDOM8}-x"
+    r = env.client.post(url(), json=p)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["pppoe_user_pattern"] == "cust-{SN}-v2"
+    assert d["pppoe_password_pattern"] == "{RANDOM8}-x"
+
+
 def test_create_menulis_audit(env):
     env.client.post(url(), json=payload())
     s = env.Session()
